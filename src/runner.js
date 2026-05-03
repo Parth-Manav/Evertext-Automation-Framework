@@ -255,23 +255,27 @@ export const runSession = async (account, sharedBrowser = null) => {
             let cleanText = stripHTML(newText);
             // ---------------------------
 
-            // --- Context Injection for Server Selection ---
-            // If we see the login prompt, inject last 1600 chars so brain sees the server list
+            // --- Context Injection ---
+            // For any prompt that requires reading earlier output (server list, event list),
+            // we inject a slice of the full cleaned buffer so the brain has full context.
+            const fullClean = stripHTML(terminalBuffer);
+
             if (cleanText.includes('Which acc u want to Login')) {
-                console.log('[Runner] 🛠️ Login prompt detected. Injecting context history...');
-                const fullClean = stripHTML(terminalBuffer);
-                // Increased buffer to ensure we capture full server list
+                // Server selection: inject history so brain can find the server index.
+                console.log('[Runner] 🛠️ Server-selection prompt detected. Injecting history...');
                 const startIdx = Math.max(0, fullClean.length - config.SERVER_LIST_CONTEXT_CHARS);
                 cleanText = fullClean.slice(startIdx);
-
-                // DEBUG: Show what brain will receive
-                console.log('[Runner] 🔍 DEBUG - Sending to brain for server selection (Last 5000 chars):');
-                console.log('--- START OF TEXT ---');
-                console.log(cleanText);
-                console.log('--- END OF TEXT ---');
                 console.log(`[Runner] Target server: ${account.targetServer}`);
+            } else if (cleanText.includes('Select the Event [')) {
+                // Event selection: inject history so brain can parse the full event list.
+                console.log('[Runner] 🗂️ Event-selection prompt detected. Injecting history...');
+                // Grab the last 3000 chars - enough to capture all listed events.
+                const startIdx = Math.max(0, fullClean.length - 3000);
+                cleanText = fullClean.slice(startIdx);
+                console.log('[Runner] 🔍 Event list context:');
+                console.log(cleanText);
             }
-            // ----------------------------------------------
+            // -------------------------------------------------
 
             // Send to brain
             const response = await brain.processTerminalOutput(cleanText, {
@@ -285,30 +289,19 @@ export const runSession = async (account, sharedBrowser = null) => {
 
             // Execute brain's command
             if (response.action === 'send_text') {
-                console.log(`[Runner] Sending: "${response.payload}"`);
+                console.log(`[Runner] ➡️ Sending: "${response.payload}"${response.context ? ` [ctx: ${response.context}]` : ''}`);
                 await wsClient.sendCommand(response.payload);
 
-                // Enhanced logging
-                if (response.payload === 'auto') {
-                } else if (response.payload === 'd') {
-                } else if (terminalBuffer.includes('Enter Restore code') && response.payload.length > 5) {
-                } else if (response.payload === 'y' && terminalBuffer.includes('spend mana')) {
-                } else if (response.payload === '3' && terminalBuffer.includes('select potion')) {
-                }
-
-                if (terminalBuffer.includes('Which acc u want to Login') && !response.payload.match(/[a-z]/i)) {
-                } else if (response.action === 'send_text' && response.context === 'server_selection') {
-                    // Parse terminal to extract server info
+                // ── Contextual Discord logging ──────────────────────────────
+                if (response.context === 'server_selection') {
+                    // Parse terminal to extract rich server info for the log
                     const lines = terminalBuffer.split('\n');
                     let serverInfo = null;
-
-                    // Find the selected server line
                     for (const line of lines) {
-                        // Match pattern: "1--> Server-Shard: 175 (E-15) || Account-Name: Cat Man || Guild: Night Raid"
+                        // Pattern: "1--> Server-Shard: 175 (E-15) || Account-Name: Cat Man || Guild: Night Raid"
                         const match = line.match(/^\s*(\d+)-->\s*Server-Shard:\s*(\d+)\s*\(([^)]+)\)\s*\|\|\s*Account-Name:\s*([^|]+)\s*\|\|\s*Guild:\s*(.+)$/);
                         if (match && match[1] === response.payload) {
                             serverInfo = {
-                                index: match[1],
                                 shard: match[2],
                                 server: match[3],
                                 accountName: match[4].trim(),
@@ -317,7 +310,6 @@ export const runSession = async (account, sharedBrowser = null) => {
                             break;
                         }
                     }
-
                     if (serverInfo) {
                         await sendLog(
                             `🚀 **${account.name}** starting\n` +
@@ -325,8 +317,28 @@ export const runSession = async (account, sharedBrowser = null) => {
                             'info'
                         );
                     } else {
-                        // Fallback if parsing fails
-                        await sendLog(`🚀 **${account.name}**: Starting session (Server index: ${response.payload})`, 'info');
+                        await sendLog(`🚀 **${account.name}**: Starting (Server index: ${response.payload})`, 'info');
+                    }
+
+                } else if (response.context === 'event_selection') {
+                    // Log which event the bot chose
+                    const lines = terminalBuffer.split('\n');
+                    let chosenEvent = null;
+                    for (const line of lines) {
+                        // Pattern: "-->2. elizabethstrythree | Coins: 0 | Expires: 2 days 14 hours left"
+                        const match = line.match(/-->\s*(\d+)\.\s*([^|]+)\|[^|]*\|\s*Expires:\s*(.+)/);
+                        if (match && match[1] === response.payload) {
+                            chosenEvent = { name: match[2].trim(), expires: match[3].trim() };
+                            break;
+                        }
+                    }
+                    if (chosenEvent) {
+                        await sendLog(
+                            `🗂️ **${account.name}**: Selected event **${chosenEvent.name}** (Expires: ${chosenEvent.expires})`,
+                            'info'
+                        );
+                    } else {
+                        await sendLog(`🗂️ **${account.name}**: Selected event index **${response.payload}**`, 'info');
                     }
                 }
 

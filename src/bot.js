@@ -137,13 +137,39 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            const embed = new EmbedBuilder()
-                .setTitle('Configured Accounts')
-                .setDescription(accounts.map(a =>
-                    `**${a.name}** (Server: ${a.targetServer})\nStatus: ${a.status}\nLast Run: ${a.lastRun ? new Date(a.lastRun).toLocaleString() : 'Never'}`
-                ).join('\n\n'));
+            const accountStrings = accounts.map(a =>
+                `**${a.name}** (Server: ${a.targetServer})\nStatus: ${a.status}\nLast Run: ${a.lastRun ? new Date(a.lastRun).toLocaleString() : 'Never'}`
+            );
 
-            await interaction.reply({ embeds: [embed] });
+            const embeds = [];
+            let currentDesc = '';
+
+            for (const str of accountStrings) {
+                if (currentDesc.length + str.length + 4 > 4000) {
+                    embeds.push(new EmbedBuilder()
+                        .setTitle(embeds.length === 0 ? 'Configured Accounts' : 'Configured Accounts (Cont.)')
+                        .setDescription(currentDesc)
+                        .setColor(0x0099FF));
+                    currentDesc = str;
+                } else {
+                    currentDesc += (currentDesc ? '\n\n' : '') + str;
+                }
+            }
+            if (currentDesc) {
+                embeds.push(new EmbedBuilder()
+                    .setTitle(embeds.length === 0 ? 'Configured Accounts' : 'Configured Accounts (Cont.)')
+                    .setDescription(currentDesc)
+                    .setColor(0x0099FF));
+            }
+
+            if (embeds.length <= 10) {
+                await interaction.reply({ embeds });
+            } else {
+                await interaction.reply({ embeds: embeds.slice(0, 10) });
+                for (let i = 10; i < embeds.length; i += 10) {
+                    await interaction.followUp({ embeds: embeds.slice(i, i + 10) });
+                }
+            }
         }
         else if (commandName === 'force_run') {
             const name = interaction.options.getString('name');

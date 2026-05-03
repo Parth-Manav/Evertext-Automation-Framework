@@ -24,7 +24,6 @@ This bot has been optimized for Zeabur's free tier:
 
 Make sure to set these in Zeabur:
 - `DISCORD_TOKEN` - Your Discord bot token
-- `GUILD_ID` - Your Discord server ID (optional, for faster command updates)
 - `ENCRYPTION_KEY` - Secret key for encrypting restore codes
 
 ## Database Persistence
