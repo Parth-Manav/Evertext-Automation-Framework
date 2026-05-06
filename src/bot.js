@@ -53,7 +53,7 @@ const commands = [
         .setDescription('Reset all accounts to pending and run them immediately (Admin Only)'),
     new SlashCommandBuilder()
         .setName('force_run_error_all_again')
-        .setDescription('Reset and run ONLY accounts with error status (Admin Only)'),
+        .setDescription('Reset and run all accounts that are not "done" (Admin Only)'),
     new SlashCommandBuilder()
         .setName('set_admin_role')
         .setDescription('Set the role that can manage the bot')
@@ -227,11 +227,11 @@ client.on('interactionCreate', async interaction => {
         else if (commandName === 'force_run_error_all_again') {
             const count = await resetErrorStatuses();
             if (count === 0) {
-                await interaction.reply({ content: '✅ No accounts found with "error" status.', ephemeral: true });
+                await interaction.reply({ content: '✅ No accounts found that are not "done".', ephemeral: true });
                 return;
             }
 
-            await interaction.reply(`🔄 **Resetting ${count} failed accounts and restarting queue...**`);
+            await interaction.reply(`🔄 **Resetting ${count} non-completed accounts and restarting queue...**`);
 
             // Start batch
             setImmediate(() => {

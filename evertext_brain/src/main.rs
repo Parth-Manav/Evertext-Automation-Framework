@@ -387,11 +387,11 @@ impl BotSession {
     // ── Helper: find a server's menu index from the listing ──────────────
 
     fn find_server_index(&self, content: &str, target_server: &str) -> Option<usize> {
-        let target = target_server.trim();
+        let target = target_server.trim().to_uppercase();
 
-        if target.to_lowercase() == "all" {
+        if target == "ALL" {
             for line in content.lines() {
-                if line.contains("All of them") {
+                if line.to_uppercase().contains("ALL OF THEM") {
                     if let Some(index_str) = line.split("-->").next() {
                         if let Ok(index) = index_str.trim().parse::<usize>() {
                             return Some(index);
@@ -403,16 +403,31 @@ impl BotSession {
         }
 
         for line in content.lines() {
-            if let Some(start_paren) = line.find('(') {
-                if let Some(end_paren) = line.find(')') {
-                    if end_paren > start_paren {
-                        let code_in_parens = &line[start_paren + 1..end_paren];
-                        let is_match = if target.starts_with("E-") || target.starts_with("EA-") {
-                            code_in_parens == target
-                        } else {
-                            let suffix = format!("-{}", target);
-                            code_in_parens.ends_with(&suffix)
-                        };
+            let line_upper = line.to_uppercase();
+            
+            if let Some(arrow_idx) = line_upper.find("-->") {
+                if let Some(pipe_idx) = line_upper.find("||") {
+                    if pipe_idx > arrow_idx {
+                        let server_info = &line_upper[arrow_idx + 3..pipe_idx];
+                        
+                        let words = server_info.split(|c| c == ' ' || c == '(' || c == ')');
+                        let mut is_match = false;
+                        
+                        for word in words {
+                            let w = word.trim();
+                            if w.is_empty() { continue; }
+                            
+                            if w == target {
+                                is_match = true;
+                                break;
+                            } else if let Some(dash_idx) = w.rfind('-') {
+                                let number_part = &w[dash_idx + 1..];
+                                if number_part == target {
+                                    is_match = true;
+                                    break;
+                                }
+                            }
+                        }
 
                         if is_match {
                             if let Some(index_str) = line.split("-->").next() {

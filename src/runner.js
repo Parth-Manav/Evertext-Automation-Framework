@@ -298,14 +298,13 @@ export const runSession = async (account, sharedBrowser = null) => {
                     const lines = terminalBuffer.split('\n');
                     let serverInfo = null;
                     for (const line of lines) {
-                        // Pattern: "1--> Server-Shard: 175 (E-15) || Account-Name: Cat Man || Guild: Night Raid"
-                        const match = line.match(/^\s*(\d+)-->\s*Server-Shard:\s*(\d+)\s*\(([^)]+)\)\s*\|\|\s*Account-Name:\s*([^|]+)\s*\|\|\s*Guild:\s*(.+)$/);
+                        // Pattern: "1--> Server-Shard: 175 (E-15)" OR "7--> Server: E-16 (176) || Account: Destiny || Guild: Fake RDC"
+                        const match = line.match(/^\s*(\d+)-->\s*(?:Server-Shard|Server):\s*([^|]+)\s*\|\|\s*Account(?:-Name)?:\s*([^|]+)\s*\|\|\s*Guild:\s*(.+)$/i);
                         if (match && match[1] === response.payload) {
                             serverInfo = {
-                                shard: match[2],
-                                server: match[3],
-                                accountName: match[4].trim(),
-                                guild: match[5].trim()
+                                server: match[2].trim(),
+                                accountName: match[3].trim(),
+                                guild: match[4].trim()
                             };
                             break;
                         }
@@ -313,7 +312,7 @@ export const runSession = async (account, sharedBrowser = null) => {
                     if (serverInfo) {
                         await sendLog(
                             `🚀 **${account.name}** starting\n` +
-                            `📍 Server-Shard: ${serverInfo.shard} (${serverInfo.server}) || Account: ${serverInfo.accountName} || Guild: ${serverInfo.guild}`,
+                            `📍 Server: ${serverInfo.server} || Account: ${serverInfo.accountName} || Guild: ${serverInfo.guild}`,
                             'info'
                         );
                     } else {

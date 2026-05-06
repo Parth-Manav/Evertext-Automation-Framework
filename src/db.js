@@ -282,7 +282,7 @@ export const resetErrorStatuses = async () => {
     await db.read();
   let count = 0;
   for (const account of db.data.accounts) {
-    if (account.status === 'error') {
+    if (account.status !== 'done' && account.status !== 'pending') {
       account.status = 'pending';
       count++;
     }
@@ -290,7 +290,7 @@ export const resetErrorStatuses = async () => {
   if (count > 0) {
     await writeAndInvalidate();
   }
-  console.log(`[DB] Reset ${count} error statuses to pending`);
+  console.log(`[DB] Reset ${count} non-done statuses to pending`);
   release();
   return count;
   } catch(e) { release(); throw e; }
