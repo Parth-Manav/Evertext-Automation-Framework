@@ -1,10 +1,25 @@
+/**
+ * @module runner
+ * @description Orchestrates the hybrid execution pipeline for a single account session.
+ * Manages the lifecycle of the browser, WebSocket client, and Rust brain,
+ * feeding terminal output to the decision engine and executing its commands.
+ */
+
 import { RustBrain } from './brain.js';
 import { sendLog } from './bot.js';
 import { BrowserController } from './browser-controller.js';
 import { EvertextWebSocketClient } from './websocket-client.js';
 import { config } from './config.js';
+import { createLogger } from './logger.js';
+import { SessionExpiredError, ServerFullError } from './errors.js';
 
-// Helper to clean HTML but PRESERVE structure for server selection
+const logger = createLogger('runner');
+
+/**
+ * Helper to clean HTML but PRESERVE structure for server selection.
+ * @param {string} html - The raw HTML output from the terminal.
+ * @returns {string} The cleaned plain-text string.
+ */
 const stripHTML = (html) => {
     return html
         .replace(/<br\s*\/?>/gi, '\n') // Convert <br> to newline
@@ -14,14 +29,24 @@ const stripHTML = (html) => {
         .trim();
 };
 
+/**
+ * Runs a full automation session for a given account.
+ * @param {import('./types.js').Account} account - The account to run.
+ * @param {BrowserController|null} [sharedBrowser=null] - An optional shared browser instance.
+ * @returns {Promise<{success: boolean, reason?: string, defer?: boolean, browser: BrowserController|null, createdBrowser: boolean}>} The session result.
+ */
 export const runSession = async (account, sharedBrowser = null) => {
     let browser = sharedBrowser; // Reuse if provided
     const createdBrowser = !sharedBrowser; // Track if we created it
 
+    // These need to be declared outside the try block for cleanup in catch
+    let wsClient = null;
+    let brain = null;
+
     try {
-        console.log('\n' + '='.repeat(60));
-        console.log(`🤖 [Runner] Starting HYBRID session for "${account.name}"`);
-        console.log('='.repeat(60));
+        logger.info('\n' + '='.repeat(60));
+        logger.info(`🤖 Starting HYBRID session for "${account.name}"`);
+        logger.info('='.repeat(60));
 
         // Get session cookie
         const { getCookies } = await import('./db.js');
@@ -34,14 +59,12 @@ export const runSession = async (account, sharedBrowser = null) => {
         let terminalBuffer = '';
         let currentUsers = 0;
         let maxUsers = 4;
-        let brain = null;
-        let wsClient = null;
 
         // 2. Start Rust brain FIRST (so it's ready)
-        console.log('[Runner] Initializing Rust brain...');
+        logger.info('Initializing Rust brain...');
         brain = new RustBrain();
         await brain.start();
-        console.log('🧠 [Runner] Rust brain initialized');
+        logger.info('🧠 Rust brain initialized');
 
         // 3. Launch/Check Browser
         if (!browser) {
@@ -51,19 +74,18 @@ export const runSession = async (account, sharedBrowser = null) => {
             // Check if login required - ensure cleanup on failure
             try {
                 if (await browser.isLoginRequired()) {
-                    throw new Error('LOGIN_REQUIRED - Cookie expired or invalid');
+                    throw new SessionExpiredError('LOGIN_REQUIRED - Cookie expired or invalid');
                 }
             } catch (err) {
-                // Cleanup WebSocket if it was created
                 if (wsClient) {
                     try { wsClient.close(); } catch (e) { }
                 }
-                throw err; // Re-throw after cleanup
+                throw err;
             }
         }
 
         // 4. Connect WebSocket (Connect BEFORE clicking Start)
-        console.log('[Runner] Connecting WebSocket...');
+        logger.info('Connecting WebSocket...');
 
         // --- Polling Loop for Connection (Retry if Terminal Full) ---
         const CONNECT_TIMEOUT = config.CONNECT_TIMEOUT_MS;
@@ -86,16 +108,17 @@ export const runSession = async (account, sharedBrowser = null) => {
                     currentUsers = data.current_users;
                     maxUsers = data.max_users;
                 });
+                
                 // Error listener for logging (logic handled in catch)
                 wsClient.on('error', (err) => {
                     if (err.message !== 'CONNECTION_FAILED') {
-                        console.error('[Runner] WebSocket error:', err.message);
+                        logger.error('WebSocket error:', err.message);
                     }
                 });
 
                 await wsClient.connect();
                 connected = true;
-                console.log('[Runner] WebSocket connected');
+                logger.info('WebSocket connected');
 
             } catch (err) {
                 retryCount++;
@@ -103,27 +126,26 @@ export const runSession = async (account, sharedBrowser = null) => {
                     // Exponential backoff: 5s, 10s, 20s, 40s, 60s (max)
                     const backoffDelay = Math.min(5000 * Math.pow(2, retryCount - 1), 60000);
                     const remainingTime = Math.floor((CONNECT_TIMEOUT - (Date.now() - startConnect)) / 1000);
-                    console.log(`⚠️ [Runner] Connection rejected (Terminal Full). Retry ${retryCount}/${MAX_RETRIES} in ${backoffDelay / 1000}s (${remainingTime}s remaining)`);
-                    await sendLog(`⏸️ **${account.name}**: Terminal full - Retry ${retryCount}/${MAX_RETRIES} in ${backoffDelay / 1000}s`, 'info');
+                    logger.warn(`Connection rejected (Terminal Full). Retry ${retryCount}/${MAX_RETRIES} in ${backoffDelay / 1000}s (${remainingTime}s remaining)`);
+                    await sendLog(`⏸️ **${account.name}**: Terminal full - Retry ${retryCount}/${MAX_RETRIES} in ${backoffDelay / 1000}s`, 'warning');
                     await new Promise(r => setTimeout(r, backoffDelay));
                 } else {
                     // Start retry logic for other connection errors too, but logging differently
-                    console.error('[Runner] Connection failed:', err.message);
+                    logger.error('Connection failed:', err.message);
                     throw err; // For now, throw on non-capacity errors
                 }
             }
         }
 
         if (!connected) {
-            throw new Error('Terminal full - Timed out after 10 minutes');
+            throw new ServerFullError('Terminal full - Timed out after 10 minutes');
         }
         // -----------------------------------------------------------
-        console.log('[Runner] WebSocket connected');
 
         // 5. Check if terminal is full BEFORE clicking Start
         if (currentUsers >= maxUsers) {
-            console.log(`⚠️ [Runner] Terminal is FULL (${currentUsers}/${maxUsers}). Waiting for slot...`);
-            await sendLog(`⏸️ **${account.name}**: Terminal full - waiting for slot`, 'info');
+            logger.warn(`Terminal is FULL (${currentUsers}/${maxUsers}). Waiting for slot...`);
+            await sendLog(`⏸️ **${account.name}**: Terminal full - waiting for slot`, 'warning');
 
             // Wait for a slot to open (event-driven)
             let checkInterval = null; // Track interval for cleanup
@@ -133,12 +155,12 @@ export const runSession = async (account, sharedBrowser = null) => {
 
                 checkInterval = setInterval(() => {
                     if (currentUsers < maxUsers) {
-                        console.log(`✅ [Runner] Slot opened! (${currentUsers}/${maxUsers})`);
+                        logger.info(`✅ Slot opened! (${currentUsers}/${maxUsers})`);
                         clearInterval(checkInterval);
                         checkInterval = null;
                         resolve(true);
                     } else if (Date.now() - startWait > MAX_WAIT_TIME) {
-                        console.log(`⏱️ [Runner] Max wait time (10 min) reached. Deferring...`);
+                        logger.warn(`⏱️ Max wait time (10 min) reached. Deferring...`);
                         clearInterval(checkInterval);
                         checkInterval = null;
                         resolve(false);
@@ -169,24 +191,24 @@ export const runSession = async (account, sharedBrowser = null) => {
         }
 
         // 6. Click Start Button (Puppeteer) - Start terminal only when ready
-        console.log('[Runner] Starting terminal via browser...');
+        logger.info('Starting terminal via browser...');
         await browser.clickStart();
 
-        console.log('✅ [Runner] Hybrid setup complete (Brain -> WebSocket -> Browser Start)\n');
+        logger.info('✅ Hybrid setup complete (Brain -> WebSocket -> Browser Start)\n');
 
         // Wait for initial terminal output to arrive via WebSocket
-        console.log('[Runner] Waiting for initial terminal data...');
+        logger.info('Waiting for initial terminal data...');
         await new Promise(r => setTimeout(r, 2000));
 
         if (terminalBuffer.length === 0) {
-            console.log('⚠️ [Runner] No terminal output received. WebSocket might not be working.');
-            console.log('⚠️ [Runner] Waiting 3 more seconds...');
+            logger.warn('No terminal output received. WebSocket might not be working.');
+            logger.warn('Waiting 3 more seconds...');
             await new Promise(r => setTimeout(r, 3000));
-            console.log(`⚠️ [Runner] Buffer after extra wait: ${terminalBuffer.length} chars`);
+            logger.warn(`Buffer after extra wait: ${terminalBuffer.length} chars`);
 
             // --- RECONNECTION FIX FOR EMPTY BUFFER ---
             if (terminalBuffer.length === 0) {
-                console.log('🔄 [Runner] Buffer STILL empty. Connection stale. Reconnecting WebSocket...');
+                logger.info('🔄 Buffer STILL empty. Connection stale. Reconnecting WebSocket...');
 
                 if (wsClient) {
                     try { wsClient.close(); } catch (e) { }
@@ -198,7 +220,7 @@ export const runSession = async (account, sharedBrowser = null) => {
                 wsClient.on('output', (data) => {
                     terminalBuffer += data;
                     // Log first chunk only to avoid spam
-                    if (terminalBuffer.length < 500) console.log(`[WebSocket] 📥 Re-connected data: ${data.length} chars`);
+                    if (terminalBuffer.length < 500) logger.info(`[WebSocket] 📥 Re-connected data: ${data.length} chars`);
                 });
 
                 wsClient.on('user_count', (data) => {
@@ -207,12 +229,12 @@ export const runSession = async (account, sharedBrowser = null) => {
                 });
 
                 wsClient.on('error', (err) => {
-                    console.error('[Runner] WebSocket error (Reconnected):', err.message);
+                    logger.error('WebSocket error (Reconnected):', err.message);
                 });
 
-                console.log('[Runner] Re-connecting...');
+                logger.info('Re-connecting...');
                 await wsClient.connect();
-                console.log('[Runner] Re-connected! Waiting 2s for data...');
+                logger.info('Re-connected! Waiting 2s for data...');
                 await new Promise(r => setTimeout(r, config.BROWSER_RECONNECT_WAIT_MS));
                 
                 if (terminalBuffer.length === 0) {
@@ -221,11 +243,9 @@ export const runSession = async (account, sharedBrowser = null) => {
             }
             // -----------------------------------------
         } else {
-            console.log(`✅ [Runner] Received ${terminalBuffer.length} chars of initial data`);
-            console.log(`📊 [Runner] First 150 chars: ${terminalBuffer.substring(0, 150)}`);
+            logger.info(`✅ Received ${terminalBuffer.length} chars of initial data`);
+            logger.debug(`First 150 chars: ${terminalBuffer.substring(0, 150)}`);
         }
-
-        // 6. Main loop starts...
 
         // 5. Main loop - Process terminal output with brain
         const startTime = Date.now();
@@ -234,12 +254,12 @@ export const runSession = async (account, sharedBrowser = null) => {
         let lastProcessedLength = 0;
         let lastDataTime = Date.now();
 
-        console.log('🧠 [Runner] Entering brain-controlled loop...\n');
+        logger.info('🧠 Entering brain-controlled loop...\n');
 
         while (Date.now() - startTime < MAX_SESSION_TIME) {
             // Check Idle Timeout
             if (Date.now() - lastDataTime > IDLE_TIMEOUT_MS) {
-                console.error(`⏱️ [Runner] Idle timeout (${IDLE_TIMEOUT_MS}ms) - No new data.`);
+                logger.error(`⏱️ Idle timeout (${IDLE_TIMEOUT_MS}ms) - No new data.`);
                 throw new Error('IDLE_TIMEOUT');
             }
 
@@ -262,18 +282,17 @@ export const runSession = async (account, sharedBrowser = null) => {
 
             if (cleanText.includes('Which acc u want to Login')) {
                 // Server selection: inject history so brain can find the server index.
-                console.log('[Runner] 🛠️ Server-selection prompt detected. Injecting history...');
+                logger.info('🛠️ Server-selection prompt detected. Injecting history...');
                 const startIdx = Math.max(0, fullClean.length - config.SERVER_LIST_CONTEXT_CHARS);
                 cleanText = fullClean.slice(startIdx);
-                console.log(`[Runner] Target server: ${account.targetServer}`);
+                logger.info(`Target server: ${account.targetServer}`);
             } else if (cleanText.includes('Select the Event [')) {
                 // Event selection: inject history so brain can parse the full event list.
-                console.log('[Runner] 🗂️ Event-selection prompt detected. Injecting history...');
+                logger.info('🗂️ Event-selection prompt detected. Injecting history...');
                 // Grab the last 3000 chars - enough to capture all listed events.
                 const startIdx = Math.max(0, fullClean.length - 3000);
                 cleanText = fullClean.slice(startIdx);
-                console.log('[Runner] 🔍 Event list context:');
-                console.log(cleanText);
+                logger.debug('Event list context provided to brain.');
             }
             // -------------------------------------------------
 
@@ -285,11 +304,11 @@ export const runSession = async (account, sharedBrowser = null) => {
                 serverToggle: account.serverToggle // Pass the toggle
             });
 
-            console.log(`[Brain Decision] Action: ${response.action}`);
+            logger.info(`[Brain Decision] Action: ${response.action}`);
 
             // Execute brain's command
             if (response.action === 'send_text') {
-                console.log(`[Runner] ➡️ Sending: "${response.payload}"${response.context ? ` [ctx: ${response.context}]` : ''}`);
+                logger.info(`➡️ Sending: "${response.payload}"${response.context ? ` [ctx: ${response.context}]` : ''}`);
                 await wsClient.sendCommand(response.payload);
 
                 // ── Contextual Discord logging ──────────────────────────────
@@ -342,7 +361,7 @@ export const runSession = async (account, sharedBrowser = null) => {
                 }
 
             } else if (response.action === 'close_terminal') {
-                console.log(`[Runner] Session complete: ${response.reason}`);
+                logger.info(`Session complete: ${response.reason}`);
 
                 // Stop terminal via Puppeteer (but don't close browser)
                 if (browser && browser.isLaunched()) {
@@ -353,11 +372,11 @@ export const runSession = async (account, sharedBrowser = null) => {
                 if (wsClient) wsClient.close();
                 if (brain) brain.stop();
 
-                console.log('='.repeat(60) + '\n');
+                logger.info('='.repeat(60) + '\n');
                 return { success: true, browser, createdBrowser };
 
             } else if (response.action === 'restart_terminal') {
-                console.log(`[Runner] Restart requested: ${response.reason}`);
+                logger.info(`Restart requested: ${response.reason}`);
 
                 // Stop terminal
                 if (browser && browser.isLaunched()) {
@@ -388,15 +407,15 @@ export const runSession = async (account, sharedBrowser = null) => {
                     terminalBuffer += data;
                 });
                 wsClient.on('error', (err) => {
-                    console.error('[Runner] WebSocket error:', err.message);
+                    logger.error('WebSocket error:', err.message);
                 });
                 await wsClient.connect();
 
-                console.log('[Runner] Terminal restarted, continuing...');
+                logger.info('Terminal restarted, continuing...');
                 continue;
 
             } else if (response.action === 'defer_account') {
-                console.log(`[Runner] Deferring account: ${response.reason}`);
+                logger.info(`Deferring account: ${response.reason}`);
 
                 if (browser && browser.isLaunched()) {
                     await browser.clickStop();
@@ -404,7 +423,7 @@ export const runSession = async (account, sharedBrowser = null) => {
                 if (wsClient) wsClient.close();
                 if (brain) brain.stop();
 
-                console.log('='.repeat(60) + '\n');
+                logger.info('='.repeat(60) + '\n');
                 return { success: false, reason: response.reason, defer: true, browser, createdBrowser };
 
             } else if (response.action === 'wait') {
@@ -414,17 +433,17 @@ export const runSession = async (account, sharedBrowser = null) => {
         }
 
         // Timeout
-        console.log('⚠️ Session timed out (15 minutes)');
+        logger.warn('⚠️ Session timed out (15 minutes)');
         if (browser && browser.isLaunched()) await browser.clickStop();
         if (wsClient) wsClient.close();
         if (brain) brain.stop();
-        console.log('='.repeat(60) + '\n');
+        logger.info('='.repeat(60) + '\n');
         return { success: false, reason: 'Session timeout', browser, createdBrowser };
 
     } catch (error) {
-        console.log('\n❌ ERROR OCCURRED');
-        console.log('💥 Error:', error.message);
-        console.log('='.repeat(60) + '\n');
+        logger.error('\n❌ ERROR OCCURRED');
+        logger.error('💥 Error:', error.message);
+        logger.info('='.repeat(60) + '\n');
 
         // Clean up carefully
         try {

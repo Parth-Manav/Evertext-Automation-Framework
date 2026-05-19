@@ -1,20 +1,46 @@
+/**
+ * @module websocket-client
+ * @description Manages the raw WebSocket connection to the game's Socket.IO server.
+ * Handles the Engine.IO handshake, ping/pong keepalives, and event parsing.
+ */
+
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
+import { createLogger } from './logger.js';
 
+const logger = createLogger('websocket-client');
 const BASE_URL = 'wss://evertext.sytes.net/socket.io/?EIO=4&transport=websocket';
 
+/**
+ * Custom WebSocket client mimicking a Socket.IO connection.
+ * @extends EventEmitter
+ */
 export class EvertextWebSocketClient extends EventEmitter {
+    /**
+     * @param {string} sessionCookie - The session cookie to authenticate the connection.
+     */
     constructor(sessionCookie) {
         super();
         this.sessionCookie = sessionCookie;
+        /** @type {WebSocket | null} */
         this.ws = null;
+        /** @type {string | null} */
         this.sid = null;
+        /** @type {number | null} */
         this.pingInterval = null;
+        /** @type {boolean} */
         this.connected = false;
+        /** @type {number} */
         this.lastActivity = Date.now();
+        /** @type {NodeJS.Timeout | null} */
         this.activityCheckInterval = null;
     }
 
+    /**
+     * Establishes the WebSocket connection and completes the Engine.IO handshake.
+     * @returns {Promise<void>} Resolves when the namespace is connected.
+     * @throws {Error} If the connection times out or fails.
+     */
     async connect() {
         return new Promise((resolve, reject) => {
             const headers = {
@@ -24,7 +50,7 @@ export class EvertextWebSocketClient extends EventEmitter {
                 'Host': 'evertext.sytes.net'
             };
 
-            console.log('[WebSocket] Connecting to EverText terminal...');
+            logger.info('Connecting to EverText terminal...');
 
             this.ws = new WebSocket(BASE_URL, { headers });
 
@@ -34,7 +60,7 @@ export class EvertextWebSocketClient extends EventEmitter {
             }, 15000);
 
             this.ws.on('open', () => {
-                console.log('[WebSocket] Connection opened, waiting for handshake...');
+                logger.info('Connection opened, waiting for handshake...');
             });
 
             this.ws.on('message', (data) => {
@@ -49,7 +75,7 @@ export class EvertextWebSocketClient extends EventEmitter {
                         const json = JSON.parse(message.substring(1));
                         this.sid = json.sid;
                         this.pingInterval = json.pingInterval || 25000;
-                        console.log(`[WebSocket] Connected! Session ID: ${this.sid}`);
+                        logger.info(`Connected! Session ID: ${this.sid}`);
 
                         // Send namespace upgrade
                         this.ws.send('40');
@@ -69,7 +95,7 @@ export class EvertextWebSocketClient extends EventEmitter {
                     }
                 } else if (message.startsWith('40')) {
                     // Namespace connected
-                    console.log('[WebSocket] Namespace connected. Ready for events.');
+                    logger.info('Namespace connected. Ready for events.');
                 } else if (message.startsWith('42')) {
                     // Event packet
                     this._handleEvent(message);
@@ -78,12 +104,12 @@ export class EvertextWebSocketClient extends EventEmitter {
 
             this.ws.on('error', (err) => {
                 clearTimeout(timeout);
-                console.error('[WebSocket] Error:', err.message);
+                logger.error('Error:', err.message);
                 reject(err);
             });
 
             this.ws.on('close', () => {
-                console.log('[WebSocket] Connection closed');
+                logger.info('Connection closed');
                 this.connected = false;
                 this._stopPing();
                 this.emit('disconnect');
@@ -91,6 +117,10 @@ export class EvertextWebSocketClient extends EventEmitter {
         });
     }
 
+    /**
+     * Starts the ping and activity check intervals.
+     * @private
+     */
     _startPing() {
         // Send periodic pings to keep connection alive
         this._pingTimer = setInterval(() => {
@@ -99,17 +129,21 @@ export class EvertextWebSocketClient extends EventEmitter {
             }
         }, Math.floor(this.pingInterval * 0.8)); // Ping before server expects it
 
-        // Start activity checker (Issue #30 fix)
+        // Start activity checker
         this.activityCheckInterval = setInterval(() => {
             const timeSinceActivity = Date.now() - this.lastActivity;
             if (timeSinceActivity > 120000) { // 2 minutes of silence
-                console.warn('[WebSocket] No activity for 2 minutes - connection may be dead');
+                logger.warn('No activity for 2 minutes - connection may be dead');
                 this.emit('error', new Error('CONNECTION_TIMEOUT'));
                 this.close();
             }
         }, 30000); // Check every 30 seconds
     }
 
+    /**
+     * Stops the ping and activity check intervals.
+     * @private
+     */
     _stopPing() {
         if (this._pingTimer) {
             clearInterval(this._pingTimer);
@@ -121,6 +155,11 @@ export class EvertextWebSocketClient extends EventEmitter {
         }
     }
 
+    /**
+     * Parses and emits events from the Socket.IO event packet.
+     * @param {string} message - The raw message string starting with '42'.
+     * @private
+     */
     _handleEvent(message) {
         try {
             const eventData = JSON.parse(message.substring(2));
@@ -130,59 +169,65 @@ export class EvertextWebSocketClient extends EventEmitter {
                 // Terminal output event
                 this.emit('output', payload.data);
             } else if (eventName === 'idle_timeout') {
-                console.log('[WebSocket] Server sent idle_timeout');
+                logger.info('Server sent idle_timeout');
                 this.emit('error', new Error('IDLE_TIMEOUT'));
             } else if (eventName === 'connection_failed') {
-                console.log('[WebSocket] Server sent connection_failed');
+                logger.info('Server sent connection_failed');
                 this.emit('error', new Error('CONNECTION_FAILED'));
             } else if (eventName === 'disconnect') {
-                console.log('[WebSocket] Server sent disconnect event');
+                logger.info('Server sent disconnect event');
                 this.emit('disconnect');
             } else if (eventName === 'user_count_update') {
                 // User count event - validate and emit for runner to check
                 if (payload && typeof payload.current_users === 'number' && typeof payload.max_users === 'number') {
                     this.emit('user_count', payload);
-                    console.log(`[WebSocket] User count: ${payload.current_users}/${payload.max_users}`);
+                    logger.debug(`User count: ${payload.current_users}/${payload.max_users}`);
                 } else {
-                    console.warn('[WebSocket] Invalid user_count_update payload:', payload);
+                    logger.warn('Invalid user_count_update payload:', payload);
                 }
             } else if (eventName === 'activity_ping') {
                 // Harmless heartbeat - ignore silently
                 return;
             } else {
                 // Unknown event - log for debugging
-                console.log(`[WebSocket] Unknown event: ${eventName}`);
+                logger.debug(`Unknown event: ${eventName}`);
             }
         } catch (e) {
-            console.error('[WebSocket] Failed to parse event:', e.message);
+            logger.error('Failed to parse event:', e.message);
         }
     }
 
+    /**
+     * Sends a command input to the remote terminal.
+     * @param {string} command - The text to send.
+     * @returns {Promise<void>}
+     * @throws {Error} If the socket is not connected.
+     */
     async sendCommand(command) {
-        console.log(`[WebSocket] 📤 Attempting to send command: "${command}"`);
+        logger.debug(`📤 Attempting to send command: "${command}"`);
 
         if (!this.ws) {
-            console.error('[WebSocket] ❌ WebSocket object is null');
+            logger.error('❌ WebSocket object is null');
             throw new Error('WebSocket not initialized');
         }
 
         const state = this.ws.readyState;
         const stateNames = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
-        console.log(`[WebSocket] Connection state: ${stateNames[state]} (${state})`);
+        logger.debug(`Connection state: ${stateNames[state]} (${state})`);
 
         if (!this.connected || state !== WebSocket.OPEN) {
-            console.error(`[WebSocket] ❌ Cannot send - not connected (state: ${stateNames[state]})`);
+            logger.error(`❌ Cannot send - not connected (state: ${stateNames[state]})`);
             throw new Error('WebSocket not connected');
         }
 
         const payload = JSON.stringify(['input', { input: command }]);
-        console.log(`[WebSocket] 📡 Sending payload: ${payload}`);
+        logger.debug(`📡 Sending payload: ${payload}`);
 
         try {
             this.ws.send('42' + payload);
-            console.log(`[WebSocket] ✅ Command sent successfully`);
+            logger.debug(`✅ Command sent successfully`);
         } catch (err) {
-            console.error(`[WebSocket] ❌ Failed to send:`, err.message);
+            logger.error(`❌ Failed to send: ${err.message}`);
             throw err;
         }
 
@@ -190,24 +235,32 @@ export class EvertextWebSocketClient extends EventEmitter {
         await new Promise(r => setTimeout(r, 300));
     }
 
+    /**
+     * Triggers the terminal start sequence via WebSocket.
+     * @returns {Promise<void>}
+     * @throws {Error} If not connected.
+     */
     async startTerminal() {
         if (!this.connected) {
             throw new Error('Must connect before starting terminal');
         }
 
-        console.log('[WebSocket] Sending stop event (cleanup)...');
+        logger.info('Sending stop event (cleanup)...');
         const stopPayload = JSON.stringify(['stop', {}]);
         this.ws.send('42' + stopPayload);
 
         await new Promise(r => setTimeout(r, 500));
 
-        console.log('[WebSocket] Sending start event...');
+        logger.info('Sending start event...');
         const startPayload = JSON.stringify(['start', { args: '' }]);
         this.ws.send('42' + startPayload);
     }
 
+    /**
+     * Closes the WebSocket connection cleanly.
+     */
     close() {
-        console.log('[WebSocket] Closing connection...');
+        logger.info('Closing connection...');
         this._stopPing();
         this.connected = false;
         if (this.ws) {

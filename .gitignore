@@ -31,3 +31,7 @@ bin/
 
 # Editor
 .vscode/
+
+# Backups
+package.json.bak
+

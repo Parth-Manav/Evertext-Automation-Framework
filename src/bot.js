@@ -1,11 +1,19 @@
-import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField, StringSelectMenuBuilder, Events } from 'discord.js';
-console.log('🔵🔵🔵 bot.js module loaded! 🔵🔵🔵');
+/**
+ * @module bot
+ * @description Discord.js bot controller for the Evertext automation framework.
+ * Handles slash command registration, permission checks, user interactions,
+ * and sending formatted log messages to the configured Discord channel.
+ */
+
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 import dotenv from 'dotenv';
 import { addAccount, getAccounts, removeAccount, encrypt, setSchedule, setCookies, getAdminRole, setAdminRole, resetAllStatuses, resetErrorStatuses, getLogChannel, setLogChannel } from './db.js';
 import { executeSession, runBatch, forceStop } from './manager.js';
+import { createLogger } from './logger.js';
 
 dotenv.config();
 
+const logger = createLogger('bot');
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const commands = [
@@ -70,23 +78,22 @@ const commands = [
         .setDescription('[ADMIN] Unmute automatic bot messages'),
 ];
 
-client.once(Events.ClientReady, async () => {
-    // ... (unchanged)
-    console.log(`[Discord] Logged in as ${client.user.tag}`);
+client.once('ready', async () => {
+    logger.info(`Logged in as ${client.user.tag}`);
 
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
-        console.log('[Discord] Refreshing application (/) commands.');
+        logger.info('Refreshing application (/) commands.');
         // If GUILD_ID is set and not the placeholder, register to guild
         if (process.env.GUILD_ID && process.env.GUILD_ID !== 'your_guild_id_here') {
             await rest.put(Routes.applicationGuildCommands(client.user.id, process.env.GUILD_ID), { body: commands });
         } else {
-            console.log('[Discord] Registering global commands (this may take a while to update)...');
+            logger.info('Registering global commands (this may take a while to update)...');
             await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
         }
-        console.log('[Discord] Successfully reloaded application (/) commands.');
+        logger.info('Successfully reloaded application (/) commands.');
     } catch (error) {
-        console.error(error);
+        logger.error('Failed to reload application (/) commands', error);
     }
 });
 
@@ -109,26 +116,33 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-
         if (commandName === 'add_account') {
             const name = interaction.options.getString('name');
             const code = interaction.options.getString('code');
             const serverToggle = interaction.options.getBoolean('server_toggle');
             let server = interaction.options.getString('server');
 
+            // Input Validation
+            if (!name || name.trim().length === 0) {
+                throw new Error("Account name cannot be empty.");
+            }
+            if (!code || code.trim().length === 0) {
+                throw new Error("Restore code cannot be empty.");
+            }
+
             // Logic Validation
-            if (serverToggle && !server) {
+            if (serverToggle && (!server || server.trim().length === 0)) {
                 await interaction.reply({ content: '❌ **Error**: You set `Server Selection: True`, so you MUST provide a `Target Server`!', ephemeral: true });
                 return;
             }
 
             // Default server string if skipping
-            if (!server) server = 'Auto-Skip';
+            if (!server || server.trim().length === 0) server = 'Auto-Skip';
 
             // Encrypt the code before storing
-            const encryptedCode = encrypt(code);
-            await addAccount(name, encryptedCode, server, serverToggle);
-            await interaction.reply({ content: `✅ Account **${name}** added!\nServer Selection: **${serverToggle ? 'Enabled' : 'Disabled'}**\nTarget: ${server}`, ephemeral: true });
+            const encryptedCode = encrypt(code.trim());
+            await addAccount(name.trim(), encryptedCode, server.trim(), serverToggle);
+            await interaction.reply({ content: `✅ Account **${name.trim()}** added!\nServer Selection: **${serverToggle ? 'Enabled' : 'Disabled'}**\nTarget: ${server.trim()}`, ephemeral: true });
         }
         else if (commandName === 'list_accounts') {
             const accounts = await getAccounts();
@@ -184,10 +198,10 @@ client.on('interactionCreate', async interaction => {
             if (name.toLowerCase() === 'all') {
                 await interaction.reply(`Starting batch session for **ALL** accounts... Check console/logs for progress.`);
                 runBatch(accounts).then(() => {
-                    interaction.followUp(`Batch session for **ALL** accounts finished.`).catch(console.error);
+                    interaction.followUp(`Batch session for **ALL** accounts finished.`).catch(err => logger.error('FollowUp error:', err));
                 }).catch(err => {
-                    console.error('Batch run error:', err);
-                    interaction.followUp(`❌ Batch run encountered an error: ${err.message}`).catch(console.error);
+                    logger.error('Batch run error:', err);
+                    interaction.followUp(`❌ Batch run encountered an error: ${err.message}`).catch(err => logger.error('FollowUp error:', err));
                 });
                 return;
             }
@@ -203,25 +217,22 @@ client.on('interactionCreate', async interaction => {
 
             executeSession(account.id).then(result => {
                 if (result.success) {
-                    interaction.followUp(`Session for **${name}** finished successfully.`).catch(console.error);
+                    interaction.followUp(`Session for **${name}** finished successfully.`).catch(err => logger.error('FollowUp error:', err));
                 } else {
-                    interaction.followUp(`Session for **${name}** failed: ${result.message}`).catch(console.error);
+                    interaction.followUp(`Session for **${name}** failed: ${result.message}`).catch(err => logger.error('FollowUp error:', err));
                 }
             }).catch(err => {
-                console.error(`Session execution error for ${name}:`, err);
-                interaction.followUp(`❌ Critical error running session for **${name}**: ${err.message}`).catch(console.error);
+                logger.error(`Session execution error for ${name}:`, err);
+                interaction.followUp(`❌ Critical error running session for **${name}**: ${err.message}`).catch(err => logger.error('FollowUp error:', err));
             });
         }
         else if (commandName === 'force_run_again_all') {
-            // Admin check (already done above, but kept for clarity if structure differs)
-            // actually the sensitive command check covers it.
-
             await interaction.reply('🔄 **Resetting all accounts and restarting queue...**');
             await resetAllStatuses();
 
             // Start batch
             setImmediate(() => {
-                runBatch().catch(err => console.error('[Bot] Batch run failed:', err));
+                runBatch().catch(err => logger.error('Batch run failed:', err));
             });
         }
         else if (commandName === 'force_run_error_all_again') {
@@ -235,7 +246,7 @@ client.on('interactionCreate', async interaction => {
 
             // Start batch
             setImmediate(() => {
-                runBatch().catch(err => console.error('[Bot] Batch run failed:', err));
+                runBatch().catch(err => logger.error('Batch run failed:', err));
             });
         }
         else if (commandName === 'force_run_all') {
@@ -253,9 +264,9 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply(`🚀 Starting ALL accounts (${accounts.length}) in queue...`);
 
             runBatch(accounts).then(() => {
-                interaction.followUp(`✅ Queue complete - all accounts processed.`).catch(console.error);
+                interaction.followUp(`✅ Queue complete - all accounts processed.`).catch(err => logger.error('FollowUp error:', err));
             }).catch(err => {
-                interaction.followUp(`❌ Queue error: ${err.message}`).catch(console.error);
+                interaction.followUp(`❌ Queue error: ${err.message}`).catch(err => logger.error('FollowUp error:', err));
             });
         }
         else if (commandName === 'force_stop_all') {
@@ -288,8 +299,10 @@ client.on('interactionCreate', async interaction => {
             }
 
             const channel = interaction.options.getChannel('channel');
+            if (!channel) throw new Error("Invalid channel specified.");
+
             await setLogChannel(channel.id);
-            await interaction.reply({ content: `✅ Log channel set to ${channel}. All bot notifications will be sent here.`, ephemeral: true });
+            await interaction.reply({ content: `✅ Log channel set to <#${channel.id}>. All bot notifications will be sent here.`, ephemeral: true });
         }
         else if (commandName === 'mute_bot' || commandName === 'unmute_bot') {
             // Admin check
@@ -307,6 +320,8 @@ client.on('interactionCreate', async interaction => {
         }
         else if (commandName === 'remove_account') {
             const name = interaction.options.getString('name');
+            if (!name) throw new Error("Account name cannot be empty.");
+
             const removed = await removeAccount(name);
 
             if (removed) {
@@ -319,13 +334,10 @@ client.on('interactionCreate', async interaction => {
             const start = interaction.options.getInteger('start_hour');
             const end = interaction.options.getInteger('end_hour');
 
-            if (start < 0 || start > 23 || end < 0 || end > 23) {
+            if (start === null || end === null || start < 0 || start > 23 || end < 0 || end > 23) {
                 await interaction.reply({ content: 'Hours must be between 0 and 23.', ephemeral: true });
                 return;
             }
-
-            // Validation removed to allow cross-midnight schedules (e.g. 22:00 to 08:00)
-            // if (start >= end) { ... }
 
             // Format as HH:00
             const startStr = `${start.toString().padStart(2, '0')}:00`;
@@ -352,54 +364,70 @@ client.on('interactionCreate', async interaction => {
             }
 
             const role = interaction.options.getRole('role');
+            if (!role) throw new Error("Invalid role specified.");
+
             await setAdminRole(role.id);
             await interaction.reply({ content: `✅ Admin role set to **${role.name}**. Users with this role can now manage the bot.` });
         }
     } catch (error) {
-        console.error('[Discord] Interaction Error:', error);
+        logger.error('Interaction Error:', error);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred.';
         if (interaction.replied || interaction.deferred) {
-            await interaction.followUp({ content: 'There was an error while executing this command!', ephemeral: true }).catch(console.error);
+            await interaction.followUp({ content: `❌ Error: ${errorMessage}`, ephemeral: true }).catch(err => logger.error('FollowUp error:', err));
         } else {
-            await interaction.reply({ content: 'There was an error while executing this command!', ephemeral: true }).catch(console.error);
+            await interaction.reply({ content: `❌ Error: ${errorMessage}`, ephemeral: true }).catch(err => logger.error('FollowUp error:', err));
         }
     }
 });
 
+/**
+ * Initializes and logs the Discord bot into the Discord API.
+ * Uses the DISCORD_TOKEN environment variable.
+ */
 export const startBot = () => {
-    client.login(process.env.DISCORD_TOKEN);
+    logger.info('Initializing Discord bot connection...');
+    client.login(process.env.DISCORD_TOKEN).catch(err => logger.error('Login failed:', err));
 };
 
 export { client };
 
+/**
+ * Sends a formatted logging message to the configured Discord channel.
+ * Uses an embedded format color-coded based on the message type.
+ * @param {string} message - The message content to send.
+ * @param {'info'|'success'|'error'|'warning'} [type='info'] - The severity/type of the log.
+ * @returns {Promise<void>}
+ */
 export const sendLog = async (message, type = 'info') => {
     // Try db first, fallback to env
     let channelId = await getLogChannel();
-    console.log('[DEBUG] sendLog called - channelId from db:', channelId);
+    logger.debug('sendLog called - channelId from db:', channelId);
     if (!channelId) {
         channelId = process.env.LOG_CHANNEL_ID;
-        console.log('[DEBUG] channelId from env:', channelId);
+        logger.debug('channelId from env:', channelId);
     }
 
     if (!channelId) {
-        console.log('[DEBUG] No channelId found - exiting sendLog');
+        logger.debug('No channelId found - exiting sendLog');
         return; // No logging channel configured
     }
 
-    console.log('[DEBUG] Fetching Discord channel...');
+    logger.debug('Fetching Discord channel...');
     const channel = await client.channels.fetch(channelId).catch((err) => {
-        console.error('[DEBUG] Channel fetch error:', err.message);
+        logger.error('Channel fetch error:', err.message);
         return null;
     });
+    
     if (!channel) {
-        console.error('[DEBUG] Channel is null!');
+        logger.error('Channel is null!');
         return;
     }
-    console.log('[DEBUG] Channel fetched OK, preparing message...');
+    logger.debug('Channel fetched OK, preparing message...');
 
     let color = 0x0099ff; // Blue (Info)
     if (type === 'success') color = 0x00ff00; // Green
     if (type === 'error') color = 0xff0000; // Red
-    if (type === 'start') color = 0xffff00; // Yellow
+    if (type === 'warning') color = 0xffff00; // Yellow
 
     const embed = new EmbedBuilder()
         .setDescription(message)
@@ -410,15 +438,15 @@ export const sendLog = async (message, type = 'info') => {
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
             await channel.send({ embeds: [embed] });
-            console.log('[DEBUG] ✅ Message sent to Discord!');
+            logger.debug('✅ Message sent to Discord!');
             return; // Success - exit
         } catch (err) {
-            console.error(`[sendLog] Attempt ${attempt}/3 failed:`, err.message);
+            logger.warn(`Attempt ${attempt}/3 failed:`, err.message);
             if (attempt < 3) {
                 // Wait before retry (exponential backoff)
                 await new Promise(r => setTimeout(r, attempt * 1000));
             }
         }
     }
-    console.error('[sendLog] Failed to send log after 3 attempts');
+    logger.error('Failed to send log after 3 attempts');
 };

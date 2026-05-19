@@ -1,6 +1,59 @@
+//! Evertext Brain - Rust State Machine
+//! 
+//! This module acts as the autonomous decision engine for the Evertext hybrid bot.
+//! It communicates with the Node.js runner via a strict JSON over stdin/stdout IPC protocol.
+//!
+//! # IPC Protocol
+//! - **Input** (stdin): The Node.js parent sends JSON objects representing `InputMessage`.
+//!   Each message contains the current raw terminal output and account context.
+//! - **Output** (stdout): The Rust brain responds with JSON objects representing `OutputCommand`.
+//!   These commands instruct the Node.js parent on what text to send over the WebSocket,
+//!   or when to close/restart the terminal.
+//!
+//! This design isolates the complex state machine logic and string parsing from the
+//! asynchronous I/O and browser control handled by Node.js.
+
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
+// ─────────────────────────────────────────────
+//  Terminal String Match Constants
+// ─────────────────────────────────────────────
+
+/// Terminal output when an invalid command is sent and the script terminates.
+const MSG_INVALID_COMMAND: &str = "Invalid Command";
+/// Accompanying text when an invalid command terminates the script.
+const MSG_EXITING_NOW: &str = "Exiting Now";
+/// Terminal output when the Zigza game server rejects the connection or code.
+const MSG_ZIGZA_ERROR: &str = "Either Zigza error or Incorrect Restore Code";
+/// Terminal output when the specific game server shard is at capacity.
+const MSG_SERVER_FULL: &str = "Server reached maximum limit";
+/// Initial prompt indicating the terminal script has started successfully.
+const MSG_ENTER_COMMAND_TO_USE: &str = "Enter Command to use";
+/// Prompt asking for the player's restore code.
+const MSG_ENTER_RESTORE_CODE: &str = "Enter Restore code";
+/// Prompt asking to select a server shard (only shown for multi-server accounts).
+const MSG_WHICH_ACC_LOGIN: &str = "Which acc u want to Login";
+/// Partial match for the mana spending prompt.
+const MSG_SPEND_MANA: &str = "spend mana on event stages";
+/// Partial match for the mana spending prompt (variation).
+const MSG_PRESS_Y_MANA: &str = "Press y to spend mana";
+/// Full prompt asking if the bot should spend mana on events.
+const MSG_PRESS_Y_EVENT: &str = "Press y to spend mana on event stages";
+/// The standard interactive menu prompt.
+const MSG_ENTER_CHOICE: &str = "Enter your choice [a / b / c / d]";
+/// Prompt asking the user to pick a specific event from a list.
+const MSG_SELECT_EVENT: &str = "Select the Event [";
+/// Prompt inside the event menu asking for the next action.
+const MSG_ENTER_COMMAND: &str = "ENTER COMMAND:";
+/// Terminal message indicating the Python script has finished successfully.
+const MSG_PROCESS_ENDED: &str = "Process ended with return code 0";
+/// Menu item representing all servers.
+const MSG_ALL_OF_THEM: &str = "ALL OF THEM";
+/// Prefix used in the terminal for numbered list items.
+const PREFIX_ARROW: &str = "-->";
+
+/// Default deserialization value for `server_toggle` (true).
 fn default_true() -> bool {
     true
 }
@@ -9,40 +62,73 @@ fn default_true() -> bool {
 //  I/O Message Types
 // ─────────────────────────────────────────────
 
+/// Represents an incoming JSON message from the Node.js parent.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
-enum InputMessage {
+pub enum InputMessage {
+    /// Sent when the brain process is first spawned.
     #[serde(rename = "init")]
     Init,
+    /// Contains the latest terminal output buffer and account context.
     #[serde(rename = "terminal_output")]
     TerminalOutput {
+        /// The raw text output from the terminal.
         content: String,
+        /// The account settings context for this session.
         account: AccountInfo,
     },
 }
 
+/// Contains account configuration and context for decision making.
 #[derive(Debug, Deserialize, Clone)]
-struct AccountInfo {
-    code: String,
+pub struct AccountInfo {
+    /// The AES-decrypted restore code.
+    pub code: String,
+    /// The target server designation (e.g., "E-15" or "All").
     #[serde(rename = "targetServer")]
-    target_server: String,
+    pub target_server: String,
+    /// Whether the server selection menu should be expected.
     #[serde(default = "default_true", rename = "server_toggle")]
-    server_toggle: bool,
+    pub server_toggle: bool,
 }
 
+/// Represents an outgoing JSON command sent to the Node.js parent.
 #[derive(Debug, Serialize)]
 #[serde(tag = "action")]
-enum OutputCommand {
+pub enum OutputCommand {
+    /// Indicates the brain has initialized and is ready to receive input.
     #[serde(rename = "ready")]
-    Ready { message: String },
+    Ready { 
+        /// A descriptive readiness message.
+        message: String 
+    },
+    /// Instructs the parent to send specific text over the WebSocket.
     #[serde(rename = "send_text")]
-    SendText { payload: String, context: Option<String> },
+    SendText { 
+        /// The text to send to the terminal.
+        payload: String, 
+        /// Optional context describing the action (e.g., "event_selection").
+        context: Option<String> 
+    },
+    /// Instructs the parent to gracefully close the terminal session.
     #[serde(rename = "close_terminal")]
-    CloseTerminal { reason: String },
+    CloseTerminal { 
+        /// The reason for closing.
+        reason: String 
+    },
+    /// Instructs the parent to forcefully restart the terminal session.
     #[serde(rename = "restart_terminal")]
-    RestartTerminal { reason: String },
+    RestartTerminal { 
+        /// The reason for restarting.
+        reason: String 
+    },
+    /// Instructs the parent to stop processing this account and defer it to the end of the queue.
     #[serde(rename = "defer_account")]
-    DeferAccount { reason: String },
+    DeferAccount { 
+        /// The reason for deferral.
+        reason: String 
+    },
+    /// Instructs the parent to do nothing and wait for more terminal output.
     #[serde(rename = "wait")]
     Wait,
 }
@@ -51,25 +137,35 @@ enum OutputCommand {
 //  State Machine States
 // ─────────────────────────────────────────────
 
+/// Represents the current phase of the automation workflow.
 #[derive(Debug, Clone, PartialEq)]
-enum BotState {
-    /// Terminal just connected - waiting for the first menu.
+pub enum BotState {
+    /// **Trigger**: Terminal just connected.
+    /// **Waits For**: `MSG_ENTER_COMMAND_TO_USE` before transitioning to `WaitingForCodePrompt`.
     Initial,
-    /// Sent "d" - waiting for the restore-code prompt.
+    /// **Trigger**: Sent "d" (direct login option).
+    /// **Waits For**: `MSG_ENTER_RESTORE_CODE` before transitioning to `WaitingForServerList` (if toggle on) or `WaitingForManaPrompt`.
     WaitingForCodePrompt,
-    /// Sent restore code - waiting for the server-selection list (if toggle on).
+    /// **Trigger**: Sent restore code.
+    /// **Waits For**: `MSG_WHICH_ACC_LOGIN` before transitioning to `WaitingForManaPrompt`.
     WaitingForServerList,
-    /// Sent server index - waiting for "Press y to spend mana on event stages :".
+    /// **Trigger**: Sent server index (or bypassed server list).
+    /// **Waits For**: `MSG_PRESS_Y_EVENT` before transitioning to `WaitingForFirstChoice`.
     WaitingForManaPrompt,
-    /// Sent "y" - waiting for the FIRST "Enter your choice [a / b / c / d]:" prompt.
+    /// **Trigger**: Sent "y" to confirm mana spending.
+    /// **Waits For**: `MSG_ENTER_CHOICE` before transitioning to `WaitingForEventList`.
     WaitingForFirstChoice,
-    /// Sent "a" - waiting for the event list + "Select the Event [1/2/3/...]:" prompt.
+    /// **Trigger**: Sent "a" to select the event menu.
+    /// **Waits For**: `MSG_SELECT_EVENT` before transitioning to `WaitingForCommand`.
     WaitingForEventList,
-    /// Sent the event index - waiting for "ENTER COMMAND:".
+    /// **Trigger**: Sent the selected event index.
+    /// **Waits For**: `MSG_ENTER_COMMAND` before transitioning to `WaitingForSecondChoice`.
     WaitingForCommand,
-    /// Sent "auto" - waiting for the SECOND "Enter your choice [a / b / c / d]:" prompt.
+    /// **Trigger**: Sent "auto" to start auto-battling.
+    /// **Waits For**: `MSG_ENTER_CHOICE` or `MSG_PROCESS_ENDED` before transitioning to `Finished`.
     WaitingForSecondChoice,
-    /// Session complete.
+    /// **Trigger**: Final step completed or process ended.
+    /// **Waits For**: The parent process to tear down the session.
     Finished,
 
     // ── ISOLATED (not reachable by the active state machine) ──────────────
@@ -81,7 +177,7 @@ enum BotState {
 /// Sub-steps for the legacy mana-refill flow (isolated, not used).
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-enum ManaRefillStep {
+pub enum ManaRefillStep {
     WaitingForYes,
     WaitingForPotionSelection,
     WaitingForAmount,
@@ -91,14 +187,19 @@ enum ManaRefillStep {
 //  Session
 // ─────────────────────────────────────────────
 
-struct BotSession {
-    state: BotState,
-    account: Option<AccountInfo>,
-    history: String,
+/// Maintains the state and history for a single execution sequence.
+pub struct BotSession {
+    /// The current phase in the state machine.
+    pub state: BotState,
+    /// The active account configuration.
+    pub account: Option<AccountInfo>,
+    /// A rolling buffer of recent terminal output to provide context.
+    pub history: String,
 }
 
 impl BotSession {
-    fn new() -> Self {
+    /// Creates a new, uninitialized `BotSession`.
+    pub fn new() -> Self {
         BotSession {
             state: BotState::Initial,
             account: None,
@@ -106,7 +207,8 @@ impl BotSession {
         }
     }
 
-    fn reset(&mut self) {
+    /// Resets the session state back to `Initial` and clears history.
+    pub fn reset(&mut self) {
         self.state = BotState::Initial;
         self.history.clear();
         self.account = None;
@@ -114,7 +216,12 @@ impl BotSession {
 
     // ── Main dispatch ────────────────────────────────────────────────────
 
-    fn process(&mut self, content: &str, account: &AccountInfo) -> OutputCommand {
+    /// Processes new terminal output, updates state, and returns the next command.
+    ///
+    /// # Arguments
+    /// * `content` - The newest chunk of text from the terminal.
+    /// * `account` - The context of the current account running.
+    pub fn process(&mut self, content: &str, account: &AccountInfo) -> OutputCommand {
         // Persist account info on first call
         if self.account.is_none() {
             self.account = Some(account.clone());
@@ -134,17 +241,17 @@ impl BotSession {
         }
 
         // ── Priority error checks (run in every state) ───────────────────
-        if content.contains("Invalid Command") && content.contains("Exiting Now") {
+        if content.contains(MSG_INVALID_COMMAND) && content.contains(MSG_EXITING_NOW) {
             return OutputCommand::RestartTerminal {
                 reason: "Invalid Command error".to_string(),
             };
         }
-        if content.contains("Either Zigza error or Incorrect Restore Code") {
+        if content.contains(MSG_ZIGZA_ERROR) {
             return OutputCommand::DeferAccount {
                 reason: "Zigza error / bad restore code - deferring".to_string(),
             };
         }
-        if content.contains("Server reached maximum limit") {
+        if content.contains(MSG_SERVER_FULL) {
             return OutputCommand::RestartTerminal {
                 reason: "Server full".to_string(),
             };
@@ -155,7 +262,7 @@ impl BotSession {
 
             // ── Step 1: Send "d" to reach the restore-code prompt ─────────
             BotState::Initial => {
-                if content.contains("Enter Command to use") {
+                if content.contains(MSG_ENTER_COMMAND_TO_USE) {
                     self.state = BotState::WaitingForCodePrompt;
                     OutputCommand::SendText {
                         payload: "d".to_string(),
@@ -168,7 +275,7 @@ impl BotSession {
 
             // ── Step 2: Send restore code ─────────────────────────────────
             BotState::WaitingForCodePrompt => {
-                if content.contains("Enter Restore code") {
+                if content.contains(MSG_ENTER_RESTORE_CODE) {
                     if account.server_toggle {
                         self.state = BotState::WaitingForServerList;
                     } else {
@@ -185,7 +292,7 @@ impl BotSession {
 
             // ── Step 3 (optional): Send server index ──────────────────────
             BotState::WaitingForServerList => {
-                if content.contains("Which acc u want to Login") {
+                if content.contains(MSG_WHICH_ACC_LOGIN) {
                     self.state = BotState::WaitingForManaPrompt;
                     let index = self
                         .find_server_index(&self.history.clone(), &account.target_server)
@@ -194,8 +301,8 @@ impl BotSession {
                         payload: index.to_string(),
                         context: Some("server_selection".to_string()),
                     }
-                } else if content.contains("spend mana on event stages")
-                    || content.contains("Press y to spend mana")
+                } else if content.contains(MSG_SPEND_MANA)
+                    || content.contains(MSG_PRESS_Y_MANA)
                 {
                     // Single-server account: no selection screen shown
                     self.state = BotState::WaitingForManaPrompt;
@@ -207,7 +314,7 @@ impl BotSession {
 
             // ── Step 4: Confirm mana spend ────────────────────────────────
             BotState::WaitingForManaPrompt => {
-                if content.contains("Press y to spend mana on event stages") {
+                if content.contains(MSG_PRESS_Y_EVENT) {
                     self.state = BotState::WaitingForFirstChoice;
                     OutputCommand::SendText {
                         payload: "y".to_string(),
@@ -220,7 +327,7 @@ impl BotSession {
 
             // ── Step 5: First [a/b/c/d] choice → send "a" ────────────────
             BotState::WaitingForFirstChoice => {
-                if content.contains("Enter your choice [a / b / c / d]") {
+                if content.contains(MSG_ENTER_CHOICE) {
                     self.state = BotState::WaitingForEventList;
                     OutputCommand::SendText {
                         payload: "a".to_string(),
@@ -233,7 +340,7 @@ impl BotSession {
 
             // ── Step 6: Parse event list, pick soonest-expiring ───────────
             BotState::WaitingForEventList => {
-                if content.contains("Select the Event [") {
+                if content.contains(MSG_SELECT_EVENT) {
                     self.state = BotState::WaitingForCommand;
 
                     // Use the full history so we capture the list even if
@@ -254,7 +361,7 @@ impl BotSession {
 
             // ── Step 7: Inside event → send "auto" ───────────────────────
             BotState::WaitingForCommand => {
-                if content.contains("ENTER COMMAND:") {
+                if content.contains(MSG_ENTER_COMMAND) {
                     self.state = BotState::WaitingForSecondChoice;
                     OutputCommand::SendText {
                         payload: "auto".to_string(),
@@ -267,13 +374,13 @@ impl BotSession {
 
             // ── Step 8: Second [a/b/c/d] choice → send "d" (exit) ────────
             BotState::WaitingForSecondChoice => {
-                if content.contains("Enter your choice [a / b / c / d]") {
+                if content.contains(MSG_ENTER_CHOICE) {
                     self.state = BotState::Finished;
                     OutputCommand::SendText {
                         payload: "d".to_string(),
                         context: None,
                     }
-                } else if content.contains("Process ended with return code 0") {
+                } else if content.contains(MSG_PROCESS_ENDED) {
                     // Terminal ended cleanly before the second prompt arrived
                     self.state = BotState::Finished;
                     OutputCommand::CloseTerminal {
@@ -286,7 +393,7 @@ impl BotSession {
 
             // ── Final: close the terminal ─────────────────────────────────
             BotState::Finished => {
-                if content.contains("Process ended with return code 0") {
+                if content.contains(MSG_PROCESS_ENDED) {
                     OutputCommand::CloseTerminal {
                         reason: "Session complete".to_string(),
                     }
@@ -302,6 +409,8 @@ impl BotSession {
 
     // ── Helper: pick the event index with the soonest expiry ─────────────
 
+    /// Parses the history to find the active game events and picks the one expiring soonest.
+    ///
     /// Parses lines like:
     ///   `-->1. beautybeaststryone | Coins: 0 | Expires: 18 days 14 hours left`
     ///   `-->2. elizabethstrythree | Coins: 0 | Expires: 2 days 14 hours left`
@@ -310,7 +419,7 @@ impl BotSession {
     /// Returns the 1-based index of the event expiring soonest.
     /// Events with `Expires: Unknown` are treated as expiring last.
     /// Falls back to index 1 if parsing fails entirely.
-    fn pick_soonest_event(&self, text: &str) -> usize {
+    pub fn pick_soonest_event(&self, text: &str) -> usize {
         let mut best_index: usize = 1;
         let mut best_hours: u64 = u64::MAX;
 
@@ -318,12 +427,12 @@ impl BotSession {
             let trimmed = line.trim();
 
             // Match lines that start with -->N.
-            if !trimmed.starts_with("-->") {
+            if !trimmed.starts_with(PREFIX_ARROW) {
                 continue;
             }
 
             // Extract the numeric index immediately after "-->"
-            let after_arrow = &trimmed[3..];
+            let after_arrow = &trimmed[PREFIX_ARROW.len()..];
             let dot_pos = match after_arrow.find('.') {
                 Some(p) => p,
                 None => continue,
@@ -386,13 +495,14 @@ impl BotSession {
 
     // ── Helper: find a server's menu index from the listing ──────────────
 
-    fn find_server_index(&self, content: &str, target_server: &str) -> Option<usize> {
+    /// Parses the server selection listing to find the correct index for a target server.
+    pub fn find_server_index(&self, content: &str, target_server: &str) -> Option<usize> {
         let target = target_server.trim().to_uppercase();
 
         if target == "ALL" {
             for line in content.lines() {
-                if line.to_uppercase().contains("ALL OF THEM") {
-                    if let Some(index_str) = line.split("-->").next() {
+                if line.to_uppercase().contains(MSG_ALL_OF_THEM) {
+                    if let Some(index_str) = line.split(PREFIX_ARROW).next() {
                         if let Ok(index) = index_str.trim().parse::<usize>() {
                             return Some(index);
                         }
@@ -405,10 +515,10 @@ impl BotSession {
         for line in content.lines() {
             let line_upper = line.to_uppercase();
             
-            if let Some(arrow_idx) = line_upper.find("-->") {
+            if let Some(arrow_idx) = line_upper.find(PREFIX_ARROW) {
                 if let Some(pipe_idx) = line_upper.find("||") {
                     if pipe_idx > arrow_idx {
-                        let server_info = &line_upper[arrow_idx + 3..pipe_idx];
+                        let server_info = &line_upper[arrow_idx + PREFIX_ARROW.len()..pipe_idx];
                         
                         let words = server_info.split(|c| c == ' ' || c == '(' || c == ')');
                         let mut is_match = false;
@@ -430,7 +540,7 @@ impl BotSession {
                         }
 
                         if is_match {
-                            if let Some(index_str) = line.split("-->").next() {
+                            if let Some(index_str) = line.split(PREFIX_ARROW).next() {
                                 if let Ok(index) = index_str.trim().parse::<usize>() {
                                     return Some(index);
                                 }

@@ -1,3 +1,10 @@
+/**
+ * @module manager
+ * @description Core orchestration engine for scheduling and executing automation sessions.
+ * Handles queue management, the daily reset cycle, concurrent session locking,
+ * and advanced retry/defer logic for rate limits.
+ */
+
 import cron from 'node-cron';
 import { getAccounts, updateAccountStatus, getAccountDecrypted, resetAllStatuses } from './db.js';
 import { runSession } from './runner.js';
@@ -6,26 +13,54 @@ import { AsyncLock } from './async-lock.js';
 import { config } from './config.js';
 import { updateActivity } from './health-server.js';
 import { rotateLogs } from './log-rotator.js';
+import { createLogger } from './logger.js';
+import { ZIGZA_DEFER_DELAY_MS, ACCOUNT_STATUS } from './constants.js';
 
+const logger = createLogger('manager');
 const lock = new AsyncLock(); // Prevent race conditions
 let isRunning = false;
-let shouldStop = false; // Kill-switch flag
-const deferredAccounts = new Map(); // Track deferred accounts with timestamps
-const deferCycles = new Map(); // Track defer cycle count per account
 
+/**
+ * Kill-switch flag. When set to true, the currently running queue will safely
+ * terminate after the active account finishes processing.
+ * @type {boolean}
+ */
+let shouldStop = false; 
+
+/**
+ * Tracks the timestamp when an account was deferred due to Zigza rate limits.
+ * The system enforces a 10-minute wait before retrying these accounts.
+ * @type {Map<string, number>}
+ */
+const deferredAccounts = new Map();
+
+/**
+ * Tracks how many times an account has entered a defer cycle.
+ * @type {Map<string, number>}
+ */
+const deferCycles = new Map();
+
+/**
+ * Activates the kill-switch, signaling the queue processor to stop accepting
+ * new accounts and exit cleanly after the current session.
+ */
 export const forceStop = () => {
-    console.log('[Manager] 🛑 FORCE STOP activated');
+    logger.warn('🛑 FORCE STOP activated');
     shouldStop = true;
 };
 
+/**
+ * Initializes the automated scheduling system.
+ * Sets up the cron job for daily resets and triggers an immediate queue check.
+ */
 export const startScheduler = () => {
-    console.log('[Manager] Scheduler started.');
+    logger.info('Scheduler started.');
     const now = new Date();
-    console.log(`[Manager] Current system time: ${now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
-    console.log(`[Manager] Next daily reset scheduled for: 00:00 IST (Asia/Kolkata timezone)`);
+    logger.info(`Current system time: ${now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
+    logger.info(`Next daily reset scheduled for: 00:00 IST (Asia/Kolkata timezone)`);
 
     // Clean old logs on startup
-    rotateLogs().catch(err => console.error('[Manager] Log rotation error:', err));
+    rotateLogs().catch(err => logger.error('Log rotation error:', err));
 
     // Daily reset check every minute to prevent drift downtime (Asia/Kolkata timezone)
     cron.schedule('* * * * *', async () => {
@@ -35,7 +70,7 @@ export const startScheduler = () => {
         
         const lastReset = await getLastResetDate();
         if (!lastReset || new Date(todayStr) > new Date(lastReset)) {
-            console.log(`[Manager] 📅 Daily reset triggered for ${todayStr} IST (Previous: ${lastReset})`);
+            logger.info(`📅 Daily reset triggered for ${todayStr} IST (Previous: ${lastReset})`);
             
             await resetAllStatuses();
             await setLastResetDate(todayStr);
@@ -52,16 +87,21 @@ export const startScheduler = () => {
     });
 
     // Check queue immediately on startup
-    console.log('[Manager] access check: Checking queue on startup...');
-    processQueueFull().catch(err => console.error('[Manager] Startup queue error:', err));
+    logger.info('Checking queue on startup...');
+    processQueueFull().catch(err => logger.error('Startup queue error:', err));
 };
 
+/**
+ * Main execution loop for processing the queue of idle/pending accounts.
+ * Implements intelligent retries, Zigza defer handling, and browser instance reuse.
+ * @returns {Promise<void>}
+ */
 const processQueueFull = async () => {
     // Acquire lock to prevent race condition
     await lock.acquire();
 
     if (isRunning) {
-        console.log('[Manager] Queue already running');
+        logger.info('Queue already running');
         lock.release();
         return;
     }
@@ -75,53 +115,56 @@ const processQueueFull = async () => {
 
     try {
         const accounts = await getAccounts();
-        const pendingAccounts = accounts.filter(a => a.status === 'idle' || a.status === 'pending');
+        const pendingAccounts = accounts.filter(a => a.status === ACCOUNT_STATUS.IDLE || a.status === ACCOUNT_STATUS.PENDING);
 
         if (pendingAccounts.length === 0) {
-            console.log('[Manager] No pending accounts');
+            logger.info('No pending accounts');
             isRunning = false;
             return;
         }
 
-        console.log(`[Manager] Processing ${pendingAccounts.length} accounts...`);
+        logger.info(`Processing ${pendingAccounts.length} accounts...`);
         await sendLog(`▶️ **Queue Started**: Processing ${pendingAccounts.length} accounts`, 'info');
 
         for (let i = 0; i < pendingAccounts.length; i++) {
             // Check kill-switch
             if (shouldStop) {
-                console.log('[Manager] 🛑 Kill-switch activated - stopping queue');
+                logger.warn('🛑 Kill-switch activated - stopping queue');
                 await sendLog('🛑 **Queue Stopped**: Force stop activated', 'error');
                 break;
             }
 
             const account = pendingAccounts[i];
 
-            // Check if this account is deferred and hasn't waited 10 minutes yet
+            // --- 10-Minute Zigza Defer Mechanism ---
+            // If an account hit a rate limit (Zigza error), it's placed in 'deferredAccounts'.
+            // We calculate elapsed time and skip the account if 10 minutes haven't passed.
+            // The account remains in the queue (or is pushed back to the end) to be retried later.
             if (deferredAccounts.has(account.id)) {
                 const deferredTime = deferredAccounts.get(account.id);
                 const elapsedMinutes = (Date.now() - deferredTime) / 60000;
 
-                if (elapsedMinutes < 10) {
-                    console.log(`[Manager] ⏭️  Skipping ${account.name} - deferred (${Math.floor(10 - elapsedMinutes)} min remaining)`);
+                if (elapsedMinutes < (ZIGZA_DEFER_DELAY_MS / 60000)) {
+                    logger.info(`⏭️  Skipping ${account.name} - deferred (${Math.floor((ZIGZA_DEFER_DELAY_MS / 60000) - elapsedMinutes)} min remaining)`);
                     continue; // Skip this account for now
                 } else {
                     // 10 minutes passed, can retry
-                    console.log(`[Manager] ✅ Retrying ${account.name} - defer wait complete`);
+                    logger.info(`✅ Retrying ${account.name} - defer wait complete`);
                     deferredAccounts.delete(account.id);
                 }
             }
 
             try {
-                console.log(`\n[Manager] [${i + 1}/${pendingAccounts.length}] Processing ${account.name}...`);
-                await updateAccountStatus(account.id, 'running');
+                logger.info(`\n[${i + 1}/${pendingAccounts.length}] Processing ${account.name}...`);
+                await updateAccountStatus(account.id, ACCOUNT_STATUS.RUNNING);
 
                 // Run session - pass shared browser
                 updateActivity();
                 const result = await runSession(await getAccountDecrypted(account.id), sharedBrowser);
 
                 if (result.success) {
-                    console.log(`[Manager] ✅ ${account.name} completed successfully`);
-                    await updateAccountStatus(account.id, 'done', new Date().toISOString());
+                    logger.info(`✅ ${account.name} completed successfully`);
+                    await updateAccountStatus(account.id, ACCOUNT_STATUS.DONE, new Date().toISOString());
                     await sendLog(`✅ **${account.name}**: Session completed successfully`, 'success');
 
                     // Update shared browser reference
@@ -136,8 +179,8 @@ const processQueueFull = async () => {
                     deferCycles.set(account.id, cycles);
 
                     if (attempts <= MAX_RETRY_ATTEMPTS && cycles <= config.MAX_DEFER_CYCLES) {
-                        console.log(`[Manager] ⏭️  ${account.name} deferred (Zigza error) - Attempt ${attempts}/3, Cycle ${cycles}/3`);
-                        await updateAccountStatus(account.id, 'deferred');
+                        logger.warn(`⏭️  ${account.name} deferred (Zigza error) - Attempt ${attempts}/3, Cycle ${cycles}/3`);
+                        await updateAccountStatus(account.id, ACCOUNT_STATUS.DEFERRED);
                         await sendLog(`⚠️ **${account.name}**: Deferred (Zigza) - Attempt ${attempts}/3, Cycle ${cycles}/3`, 'warning');
 
                         // Mark defer timestamp
@@ -147,8 +190,8 @@ const processQueueFull = async () => {
 
                         sharedBrowser = result.browser;
                     } else {
-                        console.log(`[Manager] ❌ ${account.name} failed: Max Zigza retries or defer cycles reached`);
-                        await updateAccountStatus(account.id, 'error');
+                        logger.error(`❌ ${account.name} failed: Max Zigza retries or defer cycles reached`);
+                        await updateAccountStatus(account.id, ACCOUNT_STATUS.ERROR);
                         await sendLog(`❌ **${account.name}**: Failed - Max retries/cycles reached`, 'error');
                         sharedBrowser = result.browser;
                     }
@@ -165,7 +208,7 @@ const processQueueFull = async () => {
 
                 // Check if we should retry
                 if (attempts <= MAX_RETRY_ATTEMPTS) {
-                    console.log(`[Manager] ⚠️ Error for ${account.name} (Attempt ${attempts}/${MAX_RETRY_ATTEMPTS}). Retrying...`);
+                    logger.warn(`⚠️ Error for ${account.name} (Attempt ${attempts}/${MAX_RETRY_ATTEMPTS}). Retrying...`);
                     await sendLog(`🔄 **${account.name}**: Error (${err.message}) - Retry ${attempts}/3`, 'warning');
 
                     // Restart browser ONLY if NOT a timeout/login error (as per user request)
@@ -175,9 +218,9 @@ const processQueueFull = async () => {
                     if (!isTimeoutError && sharedBrowser) {
                         try { await sharedBrowser.close(); } catch (e) { }
                         sharedBrowser = null;
-                        console.log('[Manager] Browser restarted due to critical error.');
+                        logger.info('Browser restarted due to critical error.');
                     } else if (isTimeoutError) {
-                        console.log('[Manager] Timeout error: Retrying without browser restart.');
+                        logger.info('Timeout error: Retrying without browser restart.');
                     }
 
                     // Retry immediately
@@ -186,8 +229,8 @@ const processQueueFull = async () => {
                 }
 
                 // If max retries reached:
-                console.error(`[Manager] ❌ ${account.name} failed after 3 attempts:`, err);
-                await updateAccountStatus(account.id, 'error');
+                logger.error(`❌ ${account.name} failed after ${MAX_RETRY_ATTEMPTS} attempts:`, err);
+                await updateAccountStatus(account.id, ACCOUNT_STATUS.ERROR);
                 await sendLog(`❌ **${account.name}**: Failed - Max retries reached (${err.message})`, 'error');
 
                 // Still close browser to leave clean state for NEXT account
@@ -199,22 +242,22 @@ const processQueueFull = async () => {
 
             // Wait between accounts
             if (i < pendingAccounts.length - 1 && !shouldStop) {
-                console.log(`[Manager] Waiting ${config.ACCOUNT_DELAY_MS / 1000} seconds before next ID...`);
+                logger.info(`Waiting ${config.ACCOUNT_DELAY_MS / 1000} seconds before next ID...`);
                 await new Promise(r => setTimeout(r, config.ACCOUNT_DELAY_MS));
 
                 // Stop terminal from previous ID and start fresh for next ID
                 if (sharedBrowser && sharedBrowser.isLaunched()) {
                     try {
-                        console.log('[Manager] Stopping previous terminal process...');
+                        logger.info('Stopping previous terminal process...');
                         await sharedBrowser.clickStop();
 
                         // CRITICAL: Wait for process to fully terminate
-                        console.log('[Manager] Waiting for terminal process to stop...');
+                        logger.info('Waiting for terminal process to stop...');
                         await new Promise(r => setTimeout(r, 5000)); // 5 seconds for process cleanup
 
-                        console.log('[Manager] Ready for next ID (runner will handle start)...');
+                        logger.info('Ready for next ID (runner will handle start)...');
                     } catch (e) {
-                        console.error('[Manager] Cleanup failed (non-critical):', e.message);
+                        logger.warn('Cleanup failed (non-critical):', e.message);
                         // Browser might have died, next account will create new one
                         sharedBrowser = null;
                     }
@@ -224,15 +267,15 @@ const processQueueFull = async () => {
 
         // Close browser after all IDs done
         if (sharedBrowser && sharedBrowser.isLaunched()) {
-            console.log('[Manager] All IDs processed - closing browser');
+            logger.info('All IDs processed - closing browser');
             await sharedBrowser.close();
         }
 
-        console.log('[Manager] ✅ Queue processing complete');
+        logger.info('✅ Queue processing complete');
         await sendLog('✅ **Queue Complete**: All accounts processed', 'success');
 
     } catch (err) {
-        console.error('[Manager] Queue error:', err);
+        logger.error('Queue error:', err);
         await sendLog(`❌ **Queue Error**: ${err.message}`, 'error');
 
         // Make sure browser is closed on error
@@ -247,13 +290,21 @@ const processQueueFull = async () => {
     }
 };
 
+/**
+ * Triggers a manual full run of all pending accounts.
+ * @param {Array<Object>} accounts - List of accounts (unused in current implementation, relies on DB).
+ * @returns {Promise<void>}
+ */
 export const runBatch = async (accounts) => {
-    // For manual /force_run_all
     return processQueueFull();
 };
 
+/**
+ * Executes a session for a single specific account, ignoring the queue.
+ * @param {string} accountId - The ID of the account to run.
+ * @returns {Promise<{success: boolean, message?: string}>}
+ */
 export const executeSession = async (accountId) => {
-    // For manual /force_run {name}
     const release = await lock.acquire();
     if (isRunning) {
         release();
@@ -270,24 +321,24 @@ export const executeSession = async (accountId) => {
             return { success: false, message: 'Account not found' };
         }
 
-        console.log(`[Manager] Running single account: ${account.name}`);
-        await updateAccountStatus(account.id, 'running');
+        logger.info(`Running single account: ${account.name}`);
+        await updateAccountStatus(account.id, ACCOUNT_STATUS.RUNNING);
 
         const result = await runSession(account, null);
         browser = result.browser;
 
         if (result.success) {
-            await updateAccountStatus(account.id, 'done', new Date().toISOString());
+            await updateAccountStatus(account.id, ACCOUNT_STATUS.DONE, new Date().toISOString());
             await sendLog(`✅ **${account.name}**: Session completed successfully`, 'success');
             return { success: true };
         } else {
-            await updateAccountStatus(account.id, 'error');
+            await updateAccountStatus(account.id, ACCOUNT_STATUS.ERROR);
             await sendLog(`❌ **${account.name}**: Failed - ${result.reason}`, 'error');
             return { success: false, message: result.reason };
         }
 
     } catch (err) {
-        console.error('[Manager] Error:', err);
+        logger.error('Error:', err);
         return { success: false, message: err.message };
     } finally {
         // Close browser for single runs
@@ -302,8 +353,12 @@ export const executeSession = async (accountId) => {
 
 // ==== FOUNTAIN EXECUTION FUNCTIONS ====
 
+/**
+ * Executes the fountain collection mini-session for a single account.
+ * @param {string} accountId - The ID of the account.
+ * @returns {Promise<{success: boolean, message?: string}>}
+ */
 export const executeFountain = async (accountId) => {
-    // For manual /fountain {name}
     const release = await lock.acquire();
     if (isRunning) {
         release();
@@ -320,25 +375,25 @@ export const executeFountain = async (accountId) => {
             return { success: false, message: 'Account not found' };
         }
 
-        console.log(`[Manager] Running fountain for account: ${account.name}`);
-        await updateAccountStatus(account.id, 'running');
+        logger.info(`Running fountain for account: ${account.name}`);
+        await updateAccountStatus(account.id, ACCOUNT_STATUS.RUNNING);
 
         // Pass mode: 'fountain' to runSession
         const result = await runSession(account, null, 'fountain');
         browser = result.browser;
 
         if (result.success) {
-            await updateAccountStatus(account.id, 'done', new Date().toISOString());
-            await sendLog(`ðŸŒŠ **${account.name}**: Fountain collected successfully`, 'success');
+            await updateAccountStatus(account.id, ACCOUNT_STATUS.DONE, new Date().toISOString());
+            await sendLog(`🌊 **${account.name}**: Fountain collected successfully`, 'success');
             return { success: true };
         } else {
-            await updateAccountStatus(account.id, 'error');
-            await sendLog(`âŒ **${account.name}**: Fountain failed - ${result.reason}`, 'error');
+            await updateAccountStatus(account.id, ACCOUNT_STATUS.ERROR);
+            await sendLog(`❌ **${account.name}**: Fountain failed - ${result.reason}`, 'error');
             return { success: false, message: result.reason };
         }
 
     } catch (err) {
-        console.error('[Manager] Fountain error:', err);
+        logger.error('Fountain error:', err);
         return { success: false, message: err.message };
     } finally {
         // Close browser for single runs
@@ -351,8 +406,11 @@ export const executeFountain = async (accountId) => {
     }
 };
 
+/**
+ * Runs the fountain collection mini-session for all accounts sequentially.
+ * @returns {Promise<{completed: number, message?: string, success?: boolean}>}
+ */
 export const runFountainBatch = async () => {
-    // For /fountain_all command
     if (isRunning) {
         return { success: false, message: 'Bot is already running' };
     }
@@ -366,26 +424,26 @@ export const runFountainBatch = async () => {
     try {
         const accounts = await getAccounts();
         if (accounts.length === 0) {
-            console.log('[Manager] No accounts to process');
+            logger.info('No accounts to process');
             isRunning = false;
             release();
             return { completed: 0 };
         }
 
-        console.log(`[Manager] Starting fountain batch for ${accounts.length} accounts`);
-        await sendLog(`ðŸŒŠ **Fountain Batch Started**: Processing ${accounts.length} accounts`, 'info');
+        logger.info(`Starting fountain batch for ${accounts.length} accounts`);
+        await sendLog(`🌊 **Fountain Batch Started**: Processing ${accounts.length} accounts`, 'info');
 
         for (let i = 0; i < accounts.length; i++) {
             if (shouldStop) {
-                console.log('[Manager] ðŸ›‘ Kill-switch activated - stopping fountain batch');
-                await sendLog('ðŸ›‘ **Fountain Batch Stopped**: Force stop activated', 'error');
+                logger.warn('🛑 Kill-switch activated - stopping fountain batch');
+                await sendLog('🛑 **Fountain Batch Stopped**: Force stop activated', 'error');
                 break;
             }
 
             const account = accounts[i];
             try {
-                console.log(`\n[Manager] [${i + 1}/${accounts.length}] Fountain for ${account.name}...`);
-                await updateAccountStatus(account.id, 'running');
+                logger.info(`\n[${i + 1}/${accounts.length}] Fountain for ${account.name}...`);
+                await updateAccountStatus(account.id, ACCOUNT_STATUS.RUNNING);
 
                 // Run fountain session with shared browser and mode
                 const result = await runSession(await getAccountDecrypted(account.id), sharedBrowser, 'fountain');
@@ -396,25 +454,25 @@ export const runFountainBatch = async () => {
                 }
 
                 if (result.success) {
-                    console.log(`[Manager] âœ… Fountain completed for ${account.name}`);
-                    await updateAccountStatus(account.id, 'done', new Date().toISOString());
+                    logger.info(`✅ Fountain completed for ${account.name}`);
+                    await updateAccountStatus(account.id, ACCOUNT_STATUS.DONE, new Date().toISOString());
                     completedCount++;
                 } else {
-                    console.log(`[Manager] âŒ Fountain failed for ${account.name}: ${result.reason}`);
-                    await updateAccountStatus(account.id, 'error');
+                    logger.error(`❌ Fountain failed for ${account.name}: ${result.reason}`);
+                    await updateAccountStatus(account.id, ACCOUNT_STATUS.ERROR);
                 }
 
             } catch (err) {
-                console.error(`[Manager] Error processing fountain for ${account.name}:`, err);
-                await updateAccountStatus(account.id, 'error');
+                logger.error(`Error processing fountain for ${account.name}:`, err);
+                await updateAccountStatus(account.id, ACCOUNT_STATUS.ERROR);
             }
         }
 
-        await sendLog(`âœ… **Fountain Batch Complete**: Processed ${completedCount}/${accounts.length} accounts`, 'success');
+        await sendLog(`✅ **Fountain Batch Complete**: Processed ${completedCount}/${accounts.length} accounts`, 'success');
         return { completed: completedCount };
 
     } catch (err) {
-        console.error('[Manager] Fountain batch error:', err);
+        logger.error('Fountain batch error:', err);
         throw err;
     } finally {
         // Close shared browser if created
@@ -422,7 +480,7 @@ export const runFountainBatch = async () => {
             try {
                 await sharedBrowser.close();
             } catch (e) {
-                console.error('[Manager] Error closing shared browser:', e);
+                logger.error('Error closing shared browser:', e);
             }
         }
         isRunning = false;

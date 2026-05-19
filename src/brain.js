@@ -1,72 +1,76 @@
+/**
+ * @module brain
+ * @description Node.js wrapper for the Rust-based state machine.
+ * Manages the lifecycle of the Rust child process and facilitates
+ * bidirectional IPC (Inter-Process Communication) using JSON over stdin/stdout.
+ */
+
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { createLogger } from './logger.js';
+import { BrainCommunicationError } from './errors.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const logger = createLogger('brain');
 
+/**
+ * Controller class for the Rust decision engine process.
+ */
 export class RustBrain {
     constructor() {
+        /** @type {import('child_process').ChildProcess | null} */
         this.process = null;
+        /** @type {boolean} */
         this.ready = false;
+        /** @type {Array<Function>} */
         this.responseHandlers = [];
     }
 
+    /**
+     * Spawns the Rust child process and establishes IPC channels.
+     * @returns {Promise<void>} Resolves when the brain sends the "ready" signal.
+     * @throws {Error} If the process fails to start.
+     */
     async start() {
         return new Promise((resolve, reject) => {
             // Platform-aware executable name
             const exeName = process.platform === 'win32' ? 'evertext_brain.exe' : 'evertext_brain';
 
-            // Try to resolve path relative to current executable (CAXA/Pkg) or source (Dev)
-            // In CAXA, process.execPath is the exe itself, but we need the temp directory where resources are extracted.
-            // However, caxa extraction puts things in a temp folder.
-
-            // Common pattern: check adjacent to source first
+            // Resolve path relative to current executable
             let brainPath = path.join(__dirname, '../evertext_brain/target/release', exeName);
 
-            // Quick check if file exists, if not, try root-relative (for packaged app)
-            // In caxa, __dirname might is inside the snapshot. 
-            // We'll rely on caxa including the directory.
-
-            console.log('[Brain] Resolving Rust brain path...');
-            console.log('[Brain] Candidate 1 (Source relative):', brainPath);
-
-            // Note: in caxa, we will include the folder structure. 
-            // If this fails, we might need a specific caxa check.
-
-            console.log('[Brain] Starting Rust brain:', brainPath);
+            logger.info('Resolving Rust brain path...');
+            logger.debug('Candidate 1 (Source relative):', brainPath);
+            logger.info('Starting Rust brain:', brainPath);
 
             this.process = spawn(brainPath, [], {
                 stdio: ['pipe', 'pipe', 'pipe']
             });
 
             this.process.on('error', (err) => {
-                console.error('[Brain] Failed to start:', err);
+                logger.error('Failed to start:', err);
                 reject(err);
             });
 
             this.process.stdout.on('data', (data) => {
                 const text = data.toString();
 
-                // OPTIMIZATION: Handle potential fragmented JSON (simple buffer)
-                // For now, we assume simple line-based protocol from Rust brain
-
                 const lines = text.split('\n').filter(l => l.trim());
                 for (const line of lines) {
                     try {
                         const response = JSON.parse(line);
 
-                        // --- Log Truncation & Optimization ---
                         // Don't log keep-alives or noisy events
                         if (response.action !== 'heartbeat') {
                             const logResponse = { ...response };
                             if (logResponse.payload && logResponse.payload.length > 100) {
                                 logResponse.payload = `[TRUNCATED] ${logResponse.payload.substring(0, 50)}...`;
                             }
-                            console.log('[Brain] Response:', logResponse);
+                            logger.info('Response:', logResponse);
                         }
-                        // -------------------------------------
 
                         if (response.action === 'ready') {
                             this.ready = true;
@@ -81,20 +85,20 @@ export class RustBrain {
                     } catch (e) {
                         // Common issue: Rust panic or non-JSON output
                         if (line.includes('panic')) {
-                            console.error('🔥 [Brain] CRITICAL: RUST PANIC DETECTED ->', line);
+                            logger.error('CRITICAL: RUST PANIC DETECTED ->', line);
                         } else {
-                            console.warn('[Brain] Skipped non-JSON output:', line.substring(0, 100));
+                            logger.warn('Skipped non-JSON output:', line.substring(0, 100));
                         }
                     }
                 }
             });
 
             this.process.stderr.on('data', (data) => {
-                console.error('[Brain] Stderr:', data.toString());
+                logger.error('Stderr:', data.toString());
             });
 
             this.process.on('exit', (code) => {
-                console.log('[Brain] Process exited with code:', code);
+                logger.info('Process exited with code:', code);
                 this.ready = false;
                 // Clear all pending handlers
                 while (this.responseHandlers.length > 0) {
@@ -108,23 +112,33 @@ export class RustBrain {
         });
     }
 
+    /**
+     * Sends a JSON message to the Rust process via stdin.
+     * @param {Object} msg - The message object to serialize and send.
+     * @throws {BrainCommunicationError} If the process is not running.
+     */
     sendMessage(msg) {
         if (!this.process) {
-            throw new Error('Brain process not started');
+            throw new BrainCommunicationError('Brain process not started');
         }
 
-        // --- Log Truncation ---
         const logMsg = { ...msg };
         if (logMsg.content && logMsg.content.length > 100) {
             logMsg.content = `[TRUNCATED] (${logMsg.content.length} chars) - ${logMsg.content.substring(0, 50)}...`;
         }
-        console.log('[Brain] Sending:', JSON.stringify(logMsg));
-        // ----------------------
+        logger.debug('Sending:', JSON.stringify(logMsg));
 
         const json = JSON.stringify(msg);
         this.process.stdin.write(json + '\n');
     }
 
+    /**
+     * Sends a message and waits for a response from the Rust process.
+     * @param {Object} msg - The message to send.
+     * @param {number} [timeoutMs=30000] - Max time to wait for a response.
+     * @returns {Promise<import('./types.js').BrainResponse>} The decided action payload.
+     * @throws {BrainCommunicationError} If the response times out.
+     */
     async sendAndWait(msg, timeoutMs = 30000) {
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
@@ -133,7 +147,7 @@ export class RustBrain {
                 if (index > -1) {
                     this.responseHandlers.splice(index, 1);
                 }
-                reject(new Error('Brain response timeout'));
+                reject(new BrainCommunicationError('Brain response timeout'));
             }, timeoutMs);
 
             const wrappedResolve = (response) => {
@@ -146,6 +160,12 @@ export class RustBrain {
         });
     }
 
+    /**
+     * Helper to process terminal output within a specific account context.
+     * @param {string} content - The raw terminal string.
+     * @param {import('./types.js').Account} account - The account context.
+     * @returns {Promise<import('./types.js').BrainResponse>} The brain's response.
+     */
     async processTerminalOutput(content, account) {
         const response = await this.sendAndWait({
             type: 'terminal_output',
@@ -160,9 +180,13 @@ export class RustBrain {
         return response;
     }
 
+    /**
+     * Gracefully stops the Rust process.
+     * @returns {Promise<void>}
+     */
     async stop() {
         if (this.process) {
-            console.log('[Brain] Stopping brain process...');
+            logger.info('Stopping brain process...');
 
             // Send SIGTERM for graceful shutdown
             this.process.kill('SIGTERM');
@@ -170,7 +194,7 @@ export class RustBrain {
             // Wait for exit event with timeout
             await new Promise((resolve) => {
                 const timeout = setTimeout(() => {
-                    console.log('[Brain] Process did not exit gracefully, forcing kill');
+                    logger.warn('Process did not exit gracefully, forcing kill');
                     if (this.process) {
                         this.process.kill('SIGKILL');
                     }
