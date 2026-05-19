@@ -88,8 +88,8 @@ For a detailed breakdown of the internal systems, data flows, and IPC schemas, p
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/evertext-automation.git
-   cd evertext-automation
+    git clone https://github.com/Parth-Manav/Evertext-self-bot.git
+    cd Evertext-self-bot
    ```
 
 2. **Install Node.js dependencies:**
