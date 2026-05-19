@@ -10,7 +10,8 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { createLogger } from './logger.js';
-import { BrainCommunicationError } from './errors.js';
+import { BRAIN_RESPONSE_TIMEOUT_MS, BRAIN_SHUTDOWN_GRACE_MS } from './constants.js';
+import { BrainCommunicationError, ValidationError } from './errors.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -121,6 +122,9 @@ export class RustBrain {
         if (!this.process) {
             throw new BrainCommunicationError('Brain process not started');
         }
+        if (!msg || typeof msg !== 'object' || !msg.type) {
+            throw new ValidationError('IPC message must be an object with a type field');
+        }
 
         const logMsg = { ...msg };
         if (logMsg.content && logMsg.content.length > 100) {
@@ -135,11 +139,11 @@ export class RustBrain {
     /**
      * Sends a message and waits for a response from the Rust process.
      * @param {Object} msg - The message to send.
-     * @param {number} [timeoutMs=30000] - Max time to wait for a response.
+     * @param {number} [timeoutMs] - Max time to wait for a response (default: BRAIN_RESPONSE_TIMEOUT_MS).
      * @returns {Promise<import('./types.js').BrainResponse>} The decided action payload.
      * @throws {BrainCommunicationError} If the response times out.
      */
-    async sendAndWait(msg, timeoutMs = 30000) {
+    async sendAndWait(msg, timeoutMs = BRAIN_RESPONSE_TIMEOUT_MS) {
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 // Remove handler from queue
@@ -167,6 +171,13 @@ export class RustBrain {
      * @returns {Promise<import('./types.js').BrainResponse>} The brain's response.
      */
     async processTerminalOutput(content, account) {
+        if (typeof content !== 'string') {
+            throw new ValidationError('Terminal content must be a string');
+        }
+        if (!account?.code) {
+            throw new ValidationError('Account context must include a restore code');
+        }
+
         const response = await this.sendAndWait({
             type: 'terminal_output',
             content,
@@ -199,7 +210,7 @@ export class RustBrain {
                         this.process.kill('SIGKILL');
                     }
                     resolve();
-                }, 5000); // 5 second grace period
+                }, BRAIN_SHUTDOWN_GRACE_MS);
 
                 if (this.process) {
                     this.process.once('exit', () => {

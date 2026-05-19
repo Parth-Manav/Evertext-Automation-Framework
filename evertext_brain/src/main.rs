@@ -1,17 +1,33 @@
-//! Evertext Brain - Rust State Machine
-//! 
-//! This module acts as the autonomous decision engine for the Evertext hybrid bot.
-//! It communicates with the Node.js runner via a strict JSON over stdin/stdout IPC protocol.
+//! # Evertext Brain — Stateful Decision Engine
 //!
-//! # IPC Protocol
-//! - **Input** (stdin): The Node.js parent sends JSON objects representing `InputMessage`.
-//!   Each message contains the current raw terminal output and account context.
-//! - **Output** (stdout): The Rust brain responds with JSON objects representing `OutputCommand`.
-//!   These commands instruct the Node.js parent on what text to send over the WebSocket,
-//!   or when to close/restart the terminal.
+//! Communicates with the Node.js host via JSON over stdin/stdout.
 //!
-//! This design isolates the complex state machine logic and string parsing from the
-//! asynchronous I/O and browser control handled by Node.js.
+//! ## Input format
+//! ```json
+//! { "type": "init" }
+//! ```
+//! ```json
+//! { "type": "terminal_output", "content": "...", "account": { "code": "...", "targetServer": "E-15", "server_toggle": true } }
+//! ```
+//!
+//! ## Output format
+//! ```json
+//! { "action": "ready", "message": "Rust brain initialized" }
+//! ```
+//! ```json
+//! { "action": "send_text", "payload": "1", "context": "server_selection" }
+//! ```
+//! ```json
+//! { "action": "close_terminal", "reason": "..." }
+//! ```
+//! ```json
+//! { "action": "defer_account", "reason": "..." }
+//! ```
+//! ```json
+//! { "action": "wait" }
+//! ```
+//!
+//! This design isolates deterministic state-machine logic from Node.js I/O and browser control.
 
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};

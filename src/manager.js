@@ -14,7 +14,15 @@ import { config } from './config.js';
 import { updateActivity } from './health-server.js';
 import { rotateLogs } from './log-rotator.js';
 import { createLogger } from './logger.js';
-import { ZIGZA_DEFER_DELAY_MS, ACCOUNT_STATUS } from './constants.js';
+import {
+    ZIGZA_DEFER_DELAY_MS,
+    ACCOUNT_STATUS,
+    MS_PER_MINUTE,
+    BROWSER_PROCESS_CLEANUP_MS,
+    ERROR_CODE_IDLE_TIMEOUT,
+    ERROR_CODE_LOGIN_REQUIRED
+} from './constants.js';
+import { isErrorCode } from './errors.js';
 
 const logger = createLogger('manager');
 const lock = new AsyncLock(); // Prevent race conditions
@@ -127,7 +135,9 @@ const processQueueFull = async () => {
         await sendLog(`▶️ **Queue Started**: Processing ${pendingAccounts.length} accounts`, 'info');
 
         for (let i = 0; i < pendingAccounts.length; i++) {
-            // Check kill-switch
+            // --- Kill-switch ---
+            // forceStop() sets shouldStop=true. We check at the top of each iteration so the
+            // currently running session finishes cleanly, but no further accounts are started.
             if (shouldStop) {
                 logger.warn('🛑 Kill-switch activated - stopping queue');
                 await sendLog('🛑 **Queue Stopped**: Force stop activated', 'error');
@@ -142,10 +152,11 @@ const processQueueFull = async () => {
             // The account remains in the queue (or is pushed back to the end) to be retried later.
             if (deferredAccounts.has(account.id)) {
                 const deferredTime = deferredAccounts.get(account.id);
-                const elapsedMinutes = (Date.now() - deferredTime) / 60000;
+                const elapsedMinutes = (Date.now() - deferredTime) / MS_PER_MINUTE;
+                const deferMinutes = ZIGZA_DEFER_DELAY_MS / MS_PER_MINUTE;
 
-                if (elapsedMinutes < (ZIGZA_DEFER_DELAY_MS / 60000)) {
-                    logger.info(`⏭️  Skipping ${account.name} - deferred (${Math.floor((ZIGZA_DEFER_DELAY_MS / 60000) - elapsedMinutes)} min remaining)`);
+                if (elapsedMinutes < deferMinutes) {
+                    logger.info(`⏭️  Skipping ${account.name} - deferred (${Math.floor(deferMinutes - elapsedMinutes)} min remaining)`);
                     continue; // Skip this account for now
                 } else {
                     // 10 minutes passed, can retry
@@ -213,7 +224,9 @@ const processQueueFull = async () => {
 
                     // Restart browser ONLY if NOT a timeout/login error (as per user request)
                     // If it's a crash or unknown error, we restart. If it's just timeout, we keep browser.
-                    const isTimeoutError = err.message === 'IDLE_TIMEOUT' || err.message === 'LOGIN_REQUIRED';
+                    const isTimeoutError =
+                        isErrorCode(err, ERROR_CODE_IDLE_TIMEOUT) ||
+                        isErrorCode(err, ERROR_CODE_LOGIN_REQUIRED);
 
                     if (!isTimeoutError && sharedBrowser) {
                         try { await sharedBrowser.close(); } catch (e) { }
@@ -253,7 +266,7 @@ const processQueueFull = async () => {
 
                         // CRITICAL: Wait for process to fully terminate
                         logger.info('Waiting for terminal process to stop...');
-                        await new Promise(r => setTimeout(r, 5000)); // 5 seconds for process cleanup
+                        await new Promise(r => setTimeout(r, BROWSER_PROCESS_CLEANUP_MS));
 
                         logger.info('Ready for next ID (runner will handle start)...');
                     } catch (e) {

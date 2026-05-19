@@ -7,10 +7,17 @@
 
 import puppeteer from 'puppeteer';
 import { createLogger } from './logger.js';
-import { SessionExpiredError } from './errors.js';
+import {
+    GAME_URL,
+    PUPPETEER_TIMEOUT_MS,
+    PUPPETEER_SELECTOR_TIMEOUT_MS,
+    PUPPETEER_NAV_TIMEOUT_MS,
+    PUPPETEER_STOP_POLL_MS,
+    PUPPETEER_STOP_CONFIRM_TIMEOUT_MS,
+    BROWSER_WAIT_AFTER_START_MS
+} from './constants.js';
 
 const logger = createLogger('browser-controller');
-const GAME_URL = 'https://evertext.sytes.net';
 
 /**
  * Controller class for managing the Puppeteer browser instance and pages.
@@ -44,7 +51,7 @@ export class BrowserController {
             logger.info('Starting new Chromium process...');
             this.browser = await puppeteer.launch({
                 headless: false, // Visible GUI requested by user
-                timeout: 30000,
+                timeout: PUPPETEER_TIMEOUT_MS,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -118,7 +125,7 @@ export class BrowserController {
 
         //Navigate to game
         logger.info('Navigating to game terminal...');
-        await this.page.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await this.page.goto(GAME_URL, { waitUntil: 'domcontentloaded', timeout: PUPPETEER_NAV_TIMEOUT_MS });
 
         logger.info('Browser ready');
     }
@@ -135,7 +142,7 @@ export class BrowserController {
         logger.info('Preparing to start terminal...');
 
         // Wait for button to be available
-        await this.page.waitForSelector('#startBtn', { timeout: 10000 });
+        await this.page.waitForSelector('#startBtn', { timeout: PUPPETEER_SELECTOR_TIMEOUT_MS });
 
         // Check if button is disabled (previous session still running)
         const isDisabled = await this.page.evaluate(() => {
@@ -146,17 +153,17 @@ export class BrowserController {
         if (isDisabled) {
             logger.info('Start button disabled. Refreshing...');
             await this.page.reload({ waitUntil: 'domcontentloaded' });
-            await this.page.waitForSelector('#startBtn', { timeout: 10000 });
+            await this.page.waitForSelector('#startBtn', { timeout: PUPPETEER_SELECTOR_TIMEOUT_MS });
         }
 
         logger.info('Clicking Start button...');
         await this.page.click('#startBtn');
 
         // Wait for terminal to initialize
-        await this.page.waitForSelector('#connection_status', { timeout: 10000 });
+        await this.page.waitForSelector('#connection_status', { timeout: PUPPETEER_SELECTOR_TIMEOUT_MS });
 
         // Give terminal a moment to fully connect
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, BROWSER_WAIT_AFTER_START_MS));
 
         logger.info('Terminal started and ready');
     }
@@ -186,7 +193,7 @@ export class BrowserController {
                     await this.page.waitForFunction(() => {
                         const btn = document.getElementById('startBtn');
                         return btn && !btn.disabled;
-                    }, { timeout: 5000, polling: 200 }); // Check every 200ms
+                    }, { timeout: PUPPETEER_STOP_CONFIRM_TIMEOUT_MS, polling: PUPPETEER_STOP_POLL_MS });
                     logger.info('Terminal fully stopped (Start button re-enabled)');
                 } catch (e) {
                     logger.warn('Stop confirmation timed out, but proceeding.');

@@ -7,9 +7,17 @@
 import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import { createLogger } from './logger.js';
+import {
+    WS_BASE_URL,
+    WS_CONNECTION_TIMEOUT_MS,
+    WS_PING_INTERVAL_MULTIPLIER,
+    WS_COMMAND_DELAY_MS,
+    WS_ACTIVITY_SILENCE_MS,
+    WS_ACTIVITY_CHECK_INTERVAL_MS
+} from './constants.js';
+import { ConnectionFailedError, IdleTimeoutError } from './errors.js';
 
 const logger = createLogger('websocket-client');
-const BASE_URL = 'wss://evertext.sytes.net/socket.io/?EIO=4&transport=websocket';
 
 /**
  * Custom WebSocket client mimicking a Socket.IO connection.
@@ -52,23 +60,23 @@ export class EvertextWebSocketClient extends EventEmitter {
 
             logger.info('Connecting to EverText terminal...');
 
-            this.ws = new WebSocket(BASE_URL, { headers });
+            this.ws = new WebSocket(WS_BASE_URL, { headers });
 
             const timeout = setTimeout(() => {
-                reject(new Error('Connection timeout (15s)'));
+                reject(new Error(`Connection timeout (${WS_CONNECTION_TIMEOUT_MS / 1000}s)`));
                 this.ws?.close();
-            }, 15000);
+            }, WS_CONNECTION_TIMEOUT_MS);
 
             this.ws.on('open', () => {
                 logger.info('Connection opened, waiting for handshake...');
             });
 
-            this.ws.on('message', (data) => {
+            // Socket.IO event chain: open (0) → namespace (40) → events (42) → ping/pong (2/3)
+            this.ws.on('message', (rawMessage) => {
                 clearTimeout(timeout);
-                const message = data.toString();
-                this.lastActivity = Date.now(); // Track activity for heartbeat
+                const message = rawMessage.toString();
+                this.lastActivity = Date.now();
 
-                // Handle Socket.IO protocol messages
                 if (message.startsWith('0')) {
                     // Open packet with session info
                     try {
@@ -127,17 +135,16 @@ export class EvertextWebSocketClient extends EventEmitter {
             if (this.connected && this.ws?.readyState === WebSocket.OPEN) {
                 this.ws.send('2');
             }
-        }, Math.floor(this.pingInterval * 0.8)); // Ping before server expects it
+        }, Math.floor(this.pingInterval * WS_PING_INTERVAL_MULTIPLIER));
 
-        // Start activity checker
         this.activityCheckInterval = setInterval(() => {
             const timeSinceActivity = Date.now() - this.lastActivity;
-            if (timeSinceActivity > 120000) { // 2 minutes of silence
-                logger.warn('No activity for 2 minutes - connection may be dead');
+            if (timeSinceActivity > WS_ACTIVITY_SILENCE_MS) {
+                logger.warn('No activity for extended silence window - connection may be dead');
                 this.emit('error', new Error('CONNECTION_TIMEOUT'));
                 this.close();
             }
-        }, 30000); // Check every 30 seconds
+        }, WS_ACTIVITY_CHECK_INTERVAL_MS);
     }
 
     /**
@@ -170,10 +177,10 @@ export class EvertextWebSocketClient extends EventEmitter {
                 this.emit('output', payload.data);
             } else if (eventName === 'idle_timeout') {
                 logger.info('Server sent idle_timeout');
-                this.emit('error', new Error('IDLE_TIMEOUT'));
+                this.emit('error', new IdleTimeoutError());
             } else if (eventName === 'connection_failed') {
                 logger.info('Server sent connection_failed');
-                this.emit('error', new Error('CONNECTION_FAILED'));
+                this.emit('error', new ConnectionFailedError());
             } else if (eventName === 'disconnect') {
                 logger.info('Server sent disconnect event');
                 this.emit('disconnect');
@@ -232,7 +239,7 @@ export class EvertextWebSocketClient extends EventEmitter {
         }
 
         // Small delay to prevent flooding
-        await new Promise(r => setTimeout(r, 300));
+        await new Promise(r => setTimeout(r, WS_COMMAND_DELAY_MS));
     }
 
     /**

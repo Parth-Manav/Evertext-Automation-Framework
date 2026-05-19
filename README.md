@@ -1,139 +1,204 @@
-<div align="center">
-  <h1>Evertext Automation Framework</h1>
-  <p><strong>A production-grade, event-driven hybrid automation framework</strong></p>
-  
-  <!-- Add a hero banner or the main demonstration video here -->
-  <p>
-    <em>[Insert main demonstration video/GIF of the bot running here]</em>
-  </p>
-</div>
+# Evertext Automation Framework
 
-<br />
+A production-grade hybrid automation system demonstrating multi-process inter-process communication (IPC), browser session management, and event-driven WebSocket orchestration.
 
-The **Evertext Automation Framework** is designed to interface with real-time WebSocket streams, manage headless browser sessions, and execute deterministic state machine logic via Inter-Process Communication (IPC). It is built to handle complex, long-running automation tasks that require high reliability and precise state management.
+## Technical Highlights
 
-## 📑 Table of Contents
-- [Demonstrations](#-demonstrations)
-- [Architecture Overview](#-architecture-overview)
-- [Tech Stack](#-tech-stack)
-- [Core Features](#-core-features)
-- [Setup & Execution](#-setup--execution)
-- [Deployment](#-deployment)
-- [Contributing](#-contributing)
-- [License](#-license)
+- **Hybrid architecture:** Puppeteer manages long-lived browser sessions while a raw WebSocket client handles real-time bidirectional communication — chosen to solve the session-longevity vs. performance tradeoff
+- **Cross-language IPC:** Node.js orchestrator communicates with a Rust decision engine via JSON over stdin/stdout pipes
+- **State machine in Rust:** Deterministic, typed state transitions ensure predictable behavior across all execution paths
+- **AES-encrypted storage:** Credentials stored with symmetric encryption using a user-provided key; never stored in plaintext
+- **Discord bot interface:** Slash command API for queue control, scheduling, and real-time status updates
+- **Docker-ready:** Single-container deployment with environment injection
 
----
+## Architecture Diagram
 
-## 🎥 Demonstrations
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Discord Slash Commands                          │
+│                    (queue control, scheduling, status)                  │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Manager (src/manager.js)                                               │
+│  • Sequential session queue    • Kill-switch    • 10-min defer/retry    │
+│  • Shared browser reuse        • Daily cron reset                       │
+└─────────────────────────────────┬───────────────────────────────────────┘
+                                  │ runSession()
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Runner (src/runner.js) — per-session orchestration                     │
+│  ┌──────────────┐  ┌──────────────────┐  ┌─────────────────────────┐  │
+│  │ Browser      │  │ WebSocket Client │  │ Rust Brain (child proc) │  │
+│  │ Controller   │  │ (Socket.IO/ws)   │  │ stdin/stdout JSON IPC   │  │
+│  │ Puppeteer    │  │ terminal I/O     │  │ state machine decisions │  │
+│  └──────────────┘  └──────────────────┘  └─────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  lowdb + AES (src/db.js) — encrypted credentials, schedule, cookies     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-*(Replace the placeholders below with links to your short videos or GIFs showcasing the bot)*
+## Why This Architecture?
 
-### 1. Discord Interface & Command Orchestration
-Watch how the Discord bot handles concurrent execution commands, manages the queue, and reports live status via rich embeds.
-> **[Insert Discord interaction video here]**
+| Concern | Browser-only | WebSocket-only | This hybrid |
+|--------|--------------|----------------|-------------|
+| Session longevity (cookies 24h+) | Strong | Weak (no DOM bootstrap) | Strong — Puppeteer injects cookies |
+| Real-time I/O latency | Poor (DOM polling) | Strong | Strong — WebSocket after bootstrap |
+| Stateful decision logic | Fragile in JS | Fragile in JS | Strong — Rust state machine |
+| Resource usage | High per session | Low | Medium — one shared browser, many WS connections |
+| Determinism | Low | Medium | High — typed Rust transitions |
 
-### 2. Hybrid Browser & Terminal Automation
-See Puppeteer inject cookies and bootstrap the game interface, while the custom WebSocket client seamlessly takes over the terminal stream.
-> **[Insert browser/terminal execution video here]**
+## Component Breakdown
 
-### 3. Rust Decision Engine (Sub-millisecond Parsing)
-A look at the Rust state machine processing complex server listings and event choices in real-time, executing logic autonomously.
-> **[Insert Rust logging/decision video here]**
+| Component | Path | Responsibility |
+|-----------|------|----------------|
+| **Entry / lifecycle** | `index.js` | Startup, orphan Chrome cleanup, health server, graceful shutdown |
+| **Discord orchestrator** | `src/bot.js` | Slash commands, permissions, Discord log embeds |
+| **Queue manager** | `src/manager.js` | Scheduling, retries, defer queue, kill-switch, shared browser |
+| **Session runner** | `src/runner.js` | Wires browser + WebSocket + brain for one session |
+| **Browser controller** | `src/browser-controller.js` | Chromium launch, cookie injection, Start/Stop UI |
+| **WebSocket client** | `src/websocket-client.js` | Engine.IO handshake, terminal `output`/`input` events |
+| **Brain IPC wrapper** | `src/brain.js` | Spawns Rust binary, JSON stdin/stdout |
+| **Decision engine** | `evertext_brain/src/main.rs` | Terminal parsing, state machine, action emission |
+| **Encrypted store** | `src/db.js` | lowdb JSON + AES for restore codes and settings |
+| **Structured logging** | `src/logger.js` | Timestamped, leveled, module-prefixed logs |
 
----
+## IPC Protocol Specification
 
-## 🏗 Architecture Overview
+Communication is **one JSON object per line** on stdin (Node → Rust) and stdout (Rust → Node).
 
-It leverages a polyglot architecture to maximize performance and maintainability:
+### Input (Node → Rust)
 
-- **Node.js Orchestration Layer:** Manages job queues, Discord.js command handling, and process lifecycle.
-- **Puppeteer Headless Automation:** Initializes and manages headless Chromium contexts for secure, isolated cookie injection and session bootstrapping.
-- **WebSocket Client:** Connects directly to the underlying Socket.IO streams, bypassing the UI layer to capture raw terminal output and inject commands with millisecond latency.
-- **Rust State Machine (`evertext_brain`):** A high-performance, deterministic decision engine compiled to a native binary. It communicates with the Node.js layer via standard I/O (stdin/stdout) using a strict JSON schema, parsing massive terminal logs and calculating optimal actions in under a millisecond.
+**Initialize:**
+```json
+{ "type": "init" }
+```
 
-For a detailed breakdown of the internal systems, data flows, and IPC schemas, please see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+**Terminal output:**
+```json
+{
+  "type": "terminal_output",
+  "content": "raw terminal text...",
+  "account": {
+    "name": "session-label",
+    "code": "decrypted-restore-code",
+    "targetServer": "E-15",
+    "server_toggle": true
+  }
+}
+```
 
----
+### Output (Rust → Node)
 
-## 🛠 Tech Stack
+| `action` | Fields | Meaning |
+|----------|--------|---------|
+| `ready` | `message` | Brain process initialized |
+| `send_text` | `payload`, `context?` | Send text to terminal via WebSocket |
+| `close_terminal` | `reason` | Session complete — stop browser terminal |
+| `restart_terminal` | `reason` | Stop and re-bootstrap terminal + WS |
+| `defer_account` | `reason` | Rate limit — defer session 10 minutes |
+| `wait` | — | No action; wait for more terminal output |
 
-| Component | Technology | Purpose |
-| :--- | :--- | :--- |
-| **Orchestrator** | Node.js, Discord.js | CLI/Discord Bot interface, Job Queue Management, CRON Scheduling |
-| **Decision Engine** | Rust (`cargo`) | High-speed terminal parsing and deterministic state management |
-| **Browser Context**| Puppeteer | Session bootstrapping and secure cookie injection |
-| **Networking** | `ws` (WebSocket) | Raw Socket.IO stream interception and command injection |
-| **Database** | `lowdb`, `crypto-js` | Lightweight JSON store with AES-encrypted credential storage |
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full lifecycle and state diagram.
 
----
+## State Machine Documentation
 
-## ✨ Core Features
+Rust `BotState` variants (see `evertext_brain/src/main.rs`):
 
-- **Decoupled Architecture:** The browser, WebSocket, and decision engine operate independently. The browser is used strictly for authentication and connection bootstrapping, freeing up system resources.
-- **Robust Error Handling:** Custom typed error classes (`SessionExpiredError`, `ServerFullError`, etc.) ensure predictable recovery from network interruptions and server-side timeouts.
-- **Dynamic Queue Management:** The `Manager` handles concurrent accounts, implementing exponential backoffs, automatic deferrals, and job retries without blocking the event loop.
-- **Structured Logging:** A centralized logging module filters output based on severity (`INFO`, `WARN`, `ERROR`, `DEBUG`) and seamlessly bridges internal application logs with Discord webhook alerts.
-- **Secure Credential Storage:** Employs AES symmetric encryption at rest to securely store user credentials locally.
+| State | Trigger (send) | Waits for (terminal) | Next state |
+|-------|----------------|----------------------|------------|
+| `Initial` | — | `Enter Command to use` | `WaitingForCodePrompt` |
+| `WaitingForCodePrompt` | `d` | `Enter Restore code` | `WaitingForServerList` or `WaitingForManaPrompt` |
+| `WaitingForServerList` | restore code | `Which acc u want to Login` | `WaitingForManaPrompt` |
+| `WaitingForManaPrompt` | server index | `Press y to spend mana on event stages` | `WaitingForFirstChoice` |
+| `WaitingForFirstChoice` | `y` | `Enter your choice [a / b / c / d]` | `WaitingForEventList` |
+| `WaitingForEventList` | `a` | `Select the Event [` | `WaitingForCommand` |
+| `WaitingForCommand` | event index | `ENTER COMMAND:` | `WaitingForSecondChoice` |
+| `WaitingForSecondChoice` | `auto` | choice menu or process ended | `Finished` |
+| `Finished` | — | parent teardown | — |
 
----
+## Error Handling Strategy
 
-## 🚀 Setup & Execution
+| Error | Detection | Recovery |
+|-------|-----------|----------|
+| `SessionExpiredError` | Login page detected (`LOGIN_REQUIRED`) | Retry without browser restart; user must `/set_cookies` |
+| `IdleTimeoutError` | No terminal output within idle window | Retry without browser restart |
+| `ConnectionFailedError` | WS `connection_failed` or terminal full | Exponential backoff; may defer |
+| `ServerFullError` | Connect loop timeout | Defer or fail session |
+| `ZigzaError` | Brain `defer_account` or terminal full defer | 10-minute defer; max 3 attempts/cycles |
+| `BrainCommunicationError` | IPC timeout or process death | Session fails; may retry |
+| `ValidationError` | Invalid Discord/DB/IPC input | User-facing error reply |
+| Kill-switch | `/force_stop_all` → `forceStop()` | Finish current session; stop queue |
+
+## Installation & Development Setup
 
 ### Prerequisites
-- **Node.js** (v18 or higher)
-- **Rust** (Cargo toolchain)
-- A **Discord Bot Token** (for the UI interface)
 
-### Installation
+- Node.js v18+
+- Rust (Cargo)
+- Discord bot token
 
-1. **Clone the repository:**
-   ```bash
-    git clone https://github.com/Parth-Manav/Evertext-self-bot.git
-    cd Evertext-self-bot
-   ```
-
-2. **Install Node.js dependencies:**
-   ```bash
-   npm install
-   ```
-
-3. **Compile the Rust decision engine:**
-   ```bash
-   cd evertext_brain
-   cargo build --release
-   cd ..
-   ```
-
-4. **Environment Configuration:**
-   Copy the example config and fill in your variables (like `DISCORD_TOKEN`).
-   ```bash
-   cp .env.example .env
-   ```
-
-### Running the Application
+### Steps
 
 ```bash
+git clone https://github.com/Parth-Manav/Evertext-self-bot.git
+cd Evertext-self-bot
+npm install
+
+cd evertext_brain
+cargo build --release
+cd ..
+
+cp .env.example .env
+# Edit .env with DISCORD_TOKEN and other values
+
 npm start
 ```
 
+First run may auto-generate `ENCRYPTION_KEY` in `.env`.
+
+## Configuration Reference
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DISCORD_TOKEN` | Yes | Discord bot token |
+| `GUILD_ID` | No | Guild ID for instant slash-command registration |
+| `LOG_LEVEL` | No | `DEBUG` \| `INFO` \| `WARN` \| `ERROR` (default: `INFO`) |
+| `ENCRYPTION_KEY` | Recommended | AES key for `db.json` restore codes |
+| `LOG_CHANNEL_ID` | No | Fallback Discord log channel |
+| `PORT` | No | Health server port (default: `3000`) |
+
+See [.env.example](.env.example) for examples and where to obtain each value.
+
+## Design Decisions & Tradeoffs
+
+**Why Rust for the decision engine?** Terminal output is unstructured text with branching prompts. Rust provides fast string matching, explicit state enums, and compile-time guarantees without blocking the Node.js event loop.
+
+**Why `ws` instead of raw WebSockets only?** The target service uses Socket.IO over Engine.IO. The client implements the handshake (`0` open, `40` namespace, `42` events, `2`/`3` ping/pong) rather than pulling the full Socket.IO client, keeping dependencies minimal while preserving protocol compatibility.
+
+**Why lowdb instead of SQLite or Postgres?** This is a single-operator tool with a small credential set. A JSON file with atomic writes and AES encryption avoids migration overhead and external services.
+
+**Why a single shared browser instance?** Launching Chromium per session is expensive. One browser with isolated incognito contexts per session balances memory use and cookie injection while the WebSocket layer handles real-time I/O.
+
 ---
 
-## ☁️ Deployment
+## Deployment
 
-For production deployments, it is recommended to run the bot using a process manager like `pm2`:
 ```bash
 npm install -g pm2
 pm2 start index.js --name "evertext-bot"
 ```
 
----
+See [ZEABUR_DEPLOYMENT.md](ZEABUR_DEPLOYMENT.md) for container deployment.
 
-## 🤝 Contributing
+## Contributing
 
-Please review **[CONTRIBUTING.md](CONTRIBUTING.md)** for coding standards, pull request guidelines, and local development setup instructions.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
----
+## License
 
-## 📄 License
-
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+MIT — see `LICENSE`.

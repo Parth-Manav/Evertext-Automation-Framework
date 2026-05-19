@@ -1,23 +1,28 @@
-import fs from 'fs/promises';
-import path from 'path';
+/**
+ * @module log-rotator
+ * @description Removes stale log, temp, and screenshot files from the project root.
+ */
 
-// Clean logs older than 24 hours
+import fs from 'fs/promises';
+import { createLogger } from './logger.js';
+import { LOG_ROTATION_MAX_AGE_MS } from './constants.js';
+
+const logger = createLogger('maintenance');
+
+/**
+ * Deletes `.log`, `.tmp`, and `.png` files older than 24 hours in the project root.
+ * @returns {Promise<void>}
+ */
 export const rotateLogs = async () => {
     try {
-        const logDir = './logs'; // Assuming logs are here, or just root
-        // For this bot, logs are mostly stdout, but let's check for any .log files
-        // If you don't save files, this cleans temp files or screenshots
-
         const files = await fs.readdir('.');
         const now = Date.now();
-        const MAX_AGE = 24 * 60 * 60 * 1000; // 24 Hours
-
         let deletedCount = 0;
 
         for (const file of files) {
             if (file.endsWith('.log') || file.endsWith('.tmp') || file.endsWith('.png')) {
                 const stats = await fs.stat(file);
-                if (now - stats.mtimeMs > MAX_AGE) {
+                if (now - stats.mtimeMs > LOG_ROTATION_MAX_AGE_MS) {
                     await fs.unlink(file);
                     deletedCount++;
                 }
@@ -25,9 +30,9 @@ export const rotateLogs = async () => {
         }
 
         if (deletedCount > 0) {
-            console.log(`[Maintenance] Cleaned up ${deletedCount} old temp/log files.`);
+            logger.info(`Cleaned up ${deletedCount} old temp/log files.`);
         }
     } catch (err) {
-        console.error('[Maintenance] Log rotation failed:', err.message);
+        logger.error('Log rotation failed:', err.message);
     }
 };

@@ -3,12 +3,34 @@
  * @description Custom typed errors for structured error handling across the framework.
  */
 
+import {
+    ERROR_CODE_LOGIN_REQUIRED,
+    ERROR_CODE_IDLE_TIMEOUT,
+    ERROR_CODE_CONNECTION_FAILED
+} from './constants.js';
+
+/**
+ * Base error with a stable machine-readable code for recovery logic.
+ */
+export class CodedError extends Error {
+    /**
+     * @param {string} message - Human-readable error message.
+     * @param {string} code - Stable error code for branching logic.
+     */
+    constructor(message, code) {
+        super(message);
+        this.name = 'CodedError';
+        /** @type {string} */
+        this.code = code;
+    }
+}
+
 /**
  * Thrown when a browser session expires or cookies are invalid.
  */
-export class SessionExpiredError extends Error {
+export class SessionExpiredError extends CodedError {
     constructor(message = 'Browser session expired or cookies invalid') {
-        super(message);
+        super(message, ERROR_CODE_LOGIN_REQUIRED);
         this.name = 'SessionExpiredError';
     }
 }
@@ -24,11 +46,11 @@ export class BrainCommunicationError extends Error {
 }
 
 /**
- * Thrown when the target game server imposes a rate limit or returns a specific error state.
+ * Thrown when the target service imposes a rate limit (Zigza / defer path).
  */
-export class ZigzaError extends Error {
+export class ZigzaError extends CodedError {
     constructor(message = 'Encountered Zigza error or rate limit') {
-        super(message);
+        super(message, 'ZIGZA_DEFER');
         this.name = 'ZigzaError';
     }
 }
@@ -51,4 +73,35 @@ export class ValidationError extends Error {
         super(message);
         this.name = 'ValidationError';
     }
+}
+
+/**
+ * Thrown when the terminal receives no new output within the idle window.
+ */
+export class IdleTimeoutError extends CodedError {
+    constructor(message = 'Terminal idle timeout') {
+        super(message, ERROR_CODE_IDLE_TIMEOUT);
+        this.name = 'IdleTimeoutError';
+    }
+}
+
+/**
+ * Thrown when the WebSocket connection is rejected (terminal at capacity).
+ */
+export class ConnectionFailedError extends CodedError {
+    constructor(message = 'WebSocket connection rejected') {
+        super(message, ERROR_CODE_CONNECTION_FAILED);
+        this.name = 'ConnectionFailedError';
+    }
+}
+
+/**
+ * Returns true if the error matches a known code (typed or legacy message).
+ * @param {unknown} err - Caught error value.
+ * @param {string} code - Error code constant to match.
+ * @returns {boolean}
+ */
+export function isErrorCode(err, code) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === code) return true;
+    return err instanceof Error && err.message === code;
 }

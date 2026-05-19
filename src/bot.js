@@ -10,6 +10,7 @@ import dotenv from 'dotenv';
 import { addAccount, getAccounts, removeAccount, encrypt, setSchedule, setCookies, getAdminRole, setAdminRole, resetAllStatuses, resetErrorStatuses, getLogChannel, setLogChannel } from './db.js';
 import { executeSession, runBatch, forceStop } from './manager.js';
 import { createLogger } from './logger.js';
+import { ValidationError } from './errors.js';
 
 dotenv.config();
 
@@ -124,10 +125,10 @@ client.on('interactionCreate', async interaction => {
 
             // Input Validation
             if (!name || name.trim().length === 0) {
-                throw new Error("Account name cannot be empty.");
+                throw new ValidationError('Account name cannot be empty.');
             }
             if (!code || code.trim().length === 0) {
-                throw new Error("Restore code cannot be empty.");
+                throw new ValidationError('Restore code cannot be empty.');
             }
 
             // Logic Validation
@@ -299,7 +300,7 @@ client.on('interactionCreate', async interaction => {
             }
 
             const channel = interaction.options.getChannel('channel');
-            if (!channel) throw new Error("Invalid channel specified.");
+            if (!channel) throw new ValidationError('Invalid channel specified.');
 
             await setLogChannel(channel.id);
             await interaction.reply({ content: `✅ Log channel set to <#${channel.id}>. All bot notifications will be sent here.`, ephemeral: true });
@@ -320,7 +321,7 @@ client.on('interactionCreate', async interaction => {
         }
         else if (commandName === 'remove_account') {
             const name = interaction.options.getString('name');
-            if (!name) throw new Error("Account name cannot be empty.");
+            if (!name?.trim()) throw new ValidationError('Account name cannot be empty.');
 
             const removed = await removeAccount(name);
 
@@ -349,9 +350,8 @@ client.on('interactionCreate', async interaction => {
         else if (commandName === 'set_cookies') {
             const cookies = interaction.options.getString('cookies');
             // Basic validation
-            if (!cookies || cookies.length < 5) {
-                await interaction.reply({ content: 'Invalid cookie string provided.', ephemeral: true });
-                return;
+            if (!cookies || cookies.trim().length < 5) {
+                throw new ValidationError('Invalid cookie string provided.');
             }
             await setCookies(cookies);
             await interaction.reply({ content: '✅ Global session cookies updated! New sessions will use these cookies.', ephemeral: true });
@@ -364,7 +364,7 @@ client.on('interactionCreate', async interaction => {
             }
 
             const role = interaction.options.getRole('role');
-            if (!role) throw new Error("Invalid role specified.");
+            if (!role) throw new ValidationError('Invalid role specified.');
 
             await setAdminRole(role.id);
             await interaction.reply({ content: `✅ Admin role set to **${role.name}**. Users with this role can now manage the bot.` });

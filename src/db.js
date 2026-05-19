@@ -11,6 +11,8 @@ import dotenv from 'dotenv';
 import fs from 'fs/promises';
 import { AsyncLock } from './async-lock.js';
 import { createLogger } from './logger.js';
+import { ValidationError } from './errors.js';
+import { ACCOUNT_STATUS } from './constants.js';
 
 dotenv.config();
 
@@ -156,6 +158,10 @@ export const migrateUnencryptedCodes = async () => {
  * @returns {Promise<boolean>} True if successful.
  */
 export const addAccount = async (name, encryptedCode, targetServer, serverToggle = true) => {
+  if (!name?.trim()) throw new ValidationError('Account name cannot be empty');
+  if (!encryptedCode?.trim()) throw new ValidationError('Encrypted code cannot be empty');
+  if (!targetServer?.trim()) throw new ValidationError('Target server cannot be empty');
+
   const release = await dbLock.acquire();
   try {
     await db.read();
@@ -169,7 +175,7 @@ export const addAccount = async (name, encryptedCode, targetServer, serverToggle
       encryptedCode,
       targetServer,
       serverToggle,
-      status: 'pending' // Reset status on update
+      status: ACCOUNT_STATUS.PENDING
     };
   } else {
     db.data.accounts.push({
@@ -179,7 +185,7 @@ export const addAccount = async (name, encryptedCode, targetServer, serverToggle
       targetServer,
       serverToggle,
       lastRun: null,
-      status: 'pending'
+      status: ACCOUNT_STATUS.PENDING
     });
   }
 
@@ -223,6 +229,12 @@ export const removeAccount = async (name) => {
  * @returns {Promise<void>}
  */
 export const updateAccountStatus = async (id, status, lastRun = null) => {
+  if (!id?.trim()) throw new ValidationError('Account id cannot be empty');
+  const validStatuses = Object.values(ACCOUNT_STATUS);
+  if (!validStatuses.includes(status)) {
+    throw new ValidationError(`Invalid status. Must be one of: ${validStatuses.join(', ')}`);
+  }
+
   const release = await dbLock.acquire();
   try {
     await db.read();

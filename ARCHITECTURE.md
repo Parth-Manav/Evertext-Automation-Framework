@@ -1,97 +1,159 @@
 # Architecture Document
 
+Deep technical reference for the Evertext Automation Framework.
+
 ## System Components
 
-The Evertext Automation Framework is divided into four highly specialized, decoupled components.
+### 1. Discord Orchestrator (`src/bot.js`, `src/manager.js`)
 
-### 1. The Discord Orchestrator (`src/bot.js`, `src/manager.js`)
-Serves as the primary user interface and queue manager.
-- Accepts slash commands via Discord.js.
-- Maintains an in-memory execution queue.
-- Handles job retries, exponential backoffs, and scheduling via `node-cron`.
-- Manages an emergency kill-switch (`forceStop`).
+- Accepts slash commands via Discord.js
+- Maintains permission checks (admin role + Discord Administrator)
+- Delegates execution to the manager queue
+- Bridges application logs to Discord embeds via `sendLog`
 
-### 2. The Browser Controller (`src/browser-controller.js`)
-A minimal Puppeteer wrapper.
-- Launches a shared Chromium instance to save memory.
-- Creates isolated Incognito Contexts to inject session cookies.
-- Navigates to the target URL and physically interacts with the DOM (clicking "Start" and "Stop") to bootstrap the server-side terminal session.
+### 2. Browser Controller (`src/browser-controller.js`)
 
-### 3. The WebSocket Client (`src/websocket-client.js`)
-Bypasses the web UI to interact directly with the game server.
-- Connects to the Socket.IO endpoints using the injected cookies.
-- Captures raw textual data (`output` events).
-- Emits events back to the runner (`runSession`) for processing.
-- Injects user commands (`input` events) directly into the stream.
+- Launches a shared Chromium instance (optional reuse across sessions)
+- Creates isolated incognito contexts per session
+- Injects `session` cookie and navigates to the target URL
+- Clicks DOM **Start** / **Stop** to bootstrap and tear down the server-side terminal
 
-### 4. The Rust Decision Engine (`evertext_brain/src/main.rs`)
-A deterministic, high-performance state machine.
-- Spawned as a child process by Node.js (`src/brain.js`).
-- Parses massive strings of unstructured terminal data.
-- Employs strict string-matching against predefined constants to determine the exact state of the remote terminal.
-- Calculates optimal actions (e.g., parsing dates to find the soonest-expiring event).
+### 3. WebSocket Client (`src/websocket-client.js`)
+
+- Connects to `wss://…/socket.io/?EIO=4&transport=websocket`
+- Completes Engine.IO handshake and namespace upgrade
+- Emits `output` (terminal text), `user_count`, handles `idle_timeout` and `connection_failed`
+- Sends commands via `42["input",{"input":"..."}]` packets
+
+### 4. Rust Decision Engine (`evertext_brain/src/main.rs`)
+
+- Spawned as child process by `src/brain.js`
+- Maintains `BotSession` state and rolling terminal history
+- Pattern-matches terminal prompts and returns `OutputCommand` JSON
 
 ---
 
-## Inter-Process Communication (IPC) Protocol
+## Request Lifecycle (Discord → Rust Action)
 
-The Node.js Orchestrator and the Rust Decision Engine communicate over `stdin`/`stdout` using single-line JSON payloads.
+```
+User: /force_run_all
+  │
+  ▼
+bot.js ──► manager.runBatch() / processQueueFull()
+  │
+  ▼
+manager ──► getAccountDecrypted() ──► runner.runSession(account, sharedBrowser)
+  │
+  ├─► brain.start()          send { type: "init" }  ──► { action: "ready" }
+  ├─► browser.launch()       cookie inject + navigate
+  ├─► ws.connect()           Engine.IO handshake
+  ├─► browser.clickStart()   DOM bootstrap
+  │
+  ▼
+[loop]
+  ws "output" ──► terminalBuffer
+  runner ──► brain.processTerminalOutput(buffer, account)
+  brain ──► Rust stdin JSON ──► stdout { action, payload?, ... }
+  runner ──► ws.sendCommand(payload) | clickStop | defer | restart
+  │
+  ▼
+{ action: "close_terminal" } ──► manager marks session DONE
+```
 
-### Input to Rust (`InputMessage`)
+---
 
-**Initialization:**
+## IPC Message Format
+
+### Input (`InputMessage`)
+
 ```json
 { "type": "init" }
 ```
 
-**Terminal Data Payload:**
 ```json
 {
   "type": "terminal_output",
-  "content": "Raw terminal output string...",
+  "content": "Enter Restore code",
   "account": {
-    "code": "decrypted_restore_code",
+    "code": "…",
     "targetServer": "E-15",
     "server_toggle": true
   }
 }
 ```
 
-### Output from Rust (`OutputCommand`)
+Note: Node sends `name` in account context; Rust deserializes `code`, `targetServer`, `server_toggle`.
 
-**Ready Signal:**
+### Output (`OutputCommand`)
+
 ```json
-{
-  "action": "ready",
-  "message": "Rust brain initialized"
-}
+{ "action": "ready", "message": "Rust brain initialized" }
 ```
 
-**Send Command:**
 ```json
-{
-  "action": "send_text",
-  "payload": "1",
-  "context": "server_selection"
-}
+{ "action": "send_text", "payload": "y", "context": "mana_confirm" }
 ```
 
-**System Commands:**
-- `{"action": "close_terminal", "reason": "..."}`: Closes the browser UI cleanly.
-- `{"action": "restart_terminal", "reason": "..."}`: Restarts the session.
-- `{"action": "defer_account", "reason": "..."}`: Bumps the account to the back of the queue.
-- `{"action": "wait"}`: No action required; wait for more data.
+```json
+{ "action": "close_terminal", "reason": "Process ended" }
+```
+
+```json
+{ "action": "restart_terminal", "reason": "Invalid command recovery" }
+```
+
+```json
+{ "action": "defer_account", "reason": "Either Zigza error or Incorrect Restore Code" }
+```
+
+```json
+{ "action": "wait" }
+```
 
 ---
 
-## Data Flow Lifecycle
+## State Machine Diagram
 
-1. **Queue Dispatch:** `Manager` dequeues an account and calls `Runner.runSession`.
-2. **Bootstrapping:** `Runner` spawns `RustBrain`, launches `BrowserController`, and establishes `EvertextWebSocketClient`.
-3. **Session Start:** `BrowserController` clicks the UI "Start" button.
-4. **The Loop:**
-   - `WebSocket` receives terminal text and buffers it.
-   - `Runner` periodically sends the buffer via IPC to `RustBrain`.
-   - `RustBrain` updates its internal state machine and responds with an `OutputCommand`.
-   - `Runner` executes the command (e.g., sending text via `WebSocket`).
-5. **Teardown:** `RustBrain` issues `close_terminal`, `Runner` cleans up connections and returns control to `Manager`.
+```mermaid
+stateDiagram-v2
+    [*] --> Initial
+    Initial --> WaitingForCodePrompt: Enter Command to use
+    WaitingForCodePrompt --> WaitingForServerList: sent d
+    WaitingForCodePrompt --> WaitingForManaPrompt: sent d skip server
+    WaitingForServerList --> WaitingForManaPrompt: restore code
+    WaitingForManaPrompt --> WaitingForFirstChoice: server or skip
+    WaitingForFirstChoice --> WaitingForEventList: sent y
+    WaitingForEventList --> WaitingForCommand: sent a
+    WaitingForCommand --> WaitingForSecondChoice: event index
+    WaitingForSecondChoice --> Finished: auto or menu end
+    Finished --> [*]
+```
+
+---
+
+## Concurrency Model
+
+- **Queue:** Sequential — one session runs at a time via `processQueueFull`
+- **Lock:** `AsyncLock` prevents overlapping `processQueueFull` invocations
+- **Browser:** Single shared `BrowserController` reused across sessions in a batch; incognito context per session
+- **Brain:** One Rust child process per `runSession`; stopped after each session
+- **WebSocket:** One client per session; reconnected on restart path
+
+Simultaneous multi-session execution is intentionally **not** supported to avoid terminal slot contention and rate limits.
+
+---
+
+## Known Limitations
+
+- Sequential queue only — no parallel sessions
+- Hardcoded target URL and WebSocket endpoint in constants
+- Rust brain path must exist at `evertext_brain/target/release/evertext_brain[.exe]`
+- Discord log delivery is best-effort (3 retries)
+- `ManaRefillFlow` state exists in Rust but is isolated / unused
+
+## Future Improvements
+
+- Per-operator session filtering in Discord commands
+- Configurable target URL via environment
+- Metrics export (Prometheus) from health server
+- Parallel sessions with terminal slot coordination
