@@ -10,6 +10,8 @@
 
 The Evertext Automation Framework is a multi-process automation system that combines a Puppeteer-based browser controller, a raw Engine.IO WebSocket client, and a Rust decision engine communicating over JSON stdin/stdout IPC, all orchestrated through a Discord.js v14 slash-command interface. The core engineering problem it addresses is the tradeoff between session longevity (24-hour-plus cookies injected and maintained via Chromium) and real-time I/O performance (direct WebSocket terminal streams after DOM bootstrap). The stack is Node.js (ES modules) for orchestration, Rust for deterministic state-machine parsing, discord.js v14 for the operator UI, lowdb with CryptoJS for encrypted credential storage, Puppeteer for browser lifecycle, and the `ws` package for protocol-level Socket.IO transport. Deployment targets include a multi-stage Docker image (Rust compile stage plus Chromium runtime stage), Zeabur cloud via `zeabur.json`, PM2 on Linux, and a standalone Windows executable produced by caxa. The architecture is intentionally sequential—one remote-service session at a time—to respect terminal slot limits on the target platform.
 
+📹 **[Watch the Evertest Automation Framework Guide](Evertest Automation Framework Guide.mp4)**
+
 ---
 
 ## Technical Highlights
