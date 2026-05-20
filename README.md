@@ -12,6 +12,8 @@ The Evertext Automation Framework is a multi-process automation system that comb
 
 📹 **[Watch the Evertest Automation Framework Guide](Evertest Automation Framework Guide.mp4)**
 
+https://github.com/user-attachments/assets/9e6ae87b-62be-4f77-826a-9ac8bb99c513
+
 ---
 
 ## Technical Highlights
