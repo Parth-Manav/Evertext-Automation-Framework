@@ -6,9 +6,9 @@ The project is designed to demonstrate automation engineering, process orchestra
 
 ## Demo
 
-Project walkthrough video: [Evertest Automation Framework Guide](Evertest%20Automation%20Framework%20Guide.mp4)
+GitHub attachment:
 
-GitHub attachment: [Evertext automation demo](https://github.com/user-attachments/assets/9e6ae87b-62be-4f77-826a-9ac8bb99c513)
+[Evertext automation demo](https://github.com/user-attachments/assets/9e6ae87b-62be-4f77-826a-9ac8bb99c513)
 
 ## Overview
 
