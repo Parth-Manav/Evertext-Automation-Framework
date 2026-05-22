@@ -12,10 +12,20 @@ import { fileURLToPath } from 'url';
 import { createLogger } from './logger.js';
 import { BRAIN_RESPONSE_TIMEOUT_MS, BRAIN_SHUTDOWN_GRACE_MS } from './constants.js';
 import { BrainCommunicationError, ValidationError } from './errors.js';
+import { updateHealthState } from './health-server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const logger = createLogger('brain');
+
+export function extractJsonLines(buffer, chunk) {
+    const combined = buffer + chunk;
+    const parts = combined.split('\n');
+    return {
+        lines: parts.slice(0, -1).filter(l => l.trim()),
+        rest: parts.at(-1) ?? ''
+    };
+}
 
 /**
  * Controller class for the Rust decision engine process.
@@ -28,6 +38,8 @@ export class RustBrain {
         this.ready = false;
         /** @type {Array<Function>} */
         this.responseHandlers = [];
+        /** @type {string} */
+        this.stdoutBuffer = '';
     }
 
     /**
@@ -57,9 +69,9 @@ export class RustBrain {
             });
 
             this.process.stdout.on('data', (data) => {
-                const text = data.toString();
-
-                const lines = text.split('\n').filter(l => l.trim());
+                const parsed = extractJsonLines(this.stdoutBuffer, data.toString());
+                this.stdoutBuffer = parsed.rest;
+                const lines = parsed.lines;
                 for (const line of lines) {
                     try {
                         const response = JSON.parse(line);
@@ -75,6 +87,7 @@ export class RustBrain {
 
                         if (response.action === 'ready') {
                             this.ready = true;
+                            updateHealthState({ brainRunning: true });
                             resolve();
                         }
 
@@ -101,6 +114,7 @@ export class RustBrain {
             this.process.on('exit', (code) => {
                 logger.info('Process exited with code:', code);
                 this.ready = false;
+                updateHealthState({ brainRunning: false });
                 // Clear all pending handlers
                 while (this.responseHandlers.length > 0) {
                     const handler = this.responseHandlers.shift();
@@ -198,6 +212,7 @@ export class RustBrain {
     async stop() {
         if (this.process) {
             logger.info('Stopping brain process...');
+            updateHealthState({ brainRunning: false });
 
             // Send SIGTERM for graceful shutdown
             this.process.kill('SIGTERM');

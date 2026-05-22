@@ -109,7 +109,7 @@ pub struct AccountInfo {
 }
 
 /// Represents an outgoing JSON command sent to the Node.js parent.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq)]
 #[serde(tag = "action")]
 pub enum OutputCommand {
     /// Indicates the brain has initialized and is ready to receive input.
@@ -147,6 +147,14 @@ pub enum OutputCommand {
     /// Instructs the parent to do nothing and wait for more terminal output.
     #[serde(rename = "wait")]
     Wait,
+    /// Reports a structured error to the Node.js parent.
+    #[serde(rename = "error")]
+    Error {
+        /// Stable machine-readable error code.
+        code: String,
+        /// Human-readable error message.
+        message: String,
+    },
 }
 
 // ─────────────────────────────────────────────
@@ -186,17 +194,6 @@ pub enum BotState {
 
     // ── ISOLATED (not reachable by the active state machine) ──────────────
     // Kept for reference / future use. No transition leads here.
-    #[allow(dead_code)]
-    ManaRefillFlow(ManaRefillStep),
-}
-
-/// Sub-steps for the legacy mana-refill flow (isolated, not used).
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum ManaRefillStep {
-    WaitingForYes,
-    WaitingForPotionSelection,
-    WaitingForAmount,
 }
 
 // ─────────────────────────────────────────────
@@ -419,7 +416,6 @@ impl BotSession {
             }
 
             // ── ISOLATED legacy mana-refill flow (never reached) ─────────
-            BotState::ManaRefillFlow(_) => OutputCommand::Wait,
         }
     }
 
@@ -574,6 +570,93 @@ impl BotSession {
 //  Entry point
 // ─────────────────────────────────────────────
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account() -> AccountInfo {
+        AccountInfo {
+            code: "RESTORE-CODE".to_string(),
+            target_server: "E-15".to_string(),
+            server_toggle: true,
+        }
+    }
+
+    #[test]
+    fn initial_prompt_sends_restore_flow_command() {
+        let mut session = BotSession::new();
+        let response = session.process(MSG_ENTER_COMMAND_TO_USE, &account());
+
+        assert_eq!(session.state, BotState::WaitingForCodePrompt);
+        assert_eq!(
+            response,
+            OutputCommand::SendText {
+                payload: "d".to_string(),
+                context: None,
+            }
+        );
+    }
+
+    #[test]
+    fn restore_prompt_sends_restore_code() {
+        let mut session = BotSession::new();
+        session.state = BotState::WaitingForCodePrompt;
+
+        let response = session.process(MSG_ENTER_RESTORE_CODE, &account());
+
+        assert_eq!(session.state, BotState::WaitingForServerList);
+        assert_eq!(
+            response,
+            OutputCommand::SendText {
+                payload: "RESTORE-CODE".to_string(),
+                context: None,
+            }
+        );
+    }
+
+    #[test]
+    fn server_list_parser_selects_target_server_index() {
+        let session = BotSession::new();
+        let listing = "1 --> E-12 || Alpha\n2 --> E-15 || Beta\n3 --> E-20 || Gamma";
+
+        assert_eq!(session.find_server_index(listing, "E-15"), Some(2));
+    }
+
+    #[test]
+    fn event_parser_selects_soonest_expiring_event() {
+        let session = BotSession::new();
+        let listing = "-->1. first | Coins: 0 | Expires: 18 days 14 hours left\n-->2. second | Coins: 0 | Expires: 2 days 3 hours left\n-->3. third | Coins: 0 | Expires: Unknown";
+
+        assert_eq!(session.pick_soonest_event(listing), 2);
+    }
+
+    #[test]
+    fn priority_errors_restart_or_defer() {
+        let mut session = BotSession::new();
+
+        assert_eq!(
+            session.process("Invalid Command\nExiting Now", &account()),
+            OutputCommand::RestartTerminal {
+                reason: "Invalid Command error".to_string(),
+            }
+        );
+
+        assert_eq!(
+            session.process(MSG_ZIGZA_ERROR, &account()),
+            OutputCommand::DeferAccount {
+                reason: "Zigza error / bad restore code - deferring".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_output_waits() {
+        let mut session = BotSession::new();
+
+        assert_eq!(session.process("still loading", &account()), OutputCommand::Wait);
+    }
+}
+
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -589,6 +672,14 @@ fn main() {
             Ok(msg) => msg,
             Err(e) => {
                 eprintln!("[Rust Brain] Failed to parse input: {}", e);
+                let response = OutputCommand::Error {
+                    code: "INVALID_INPUT".to_string(),
+                    message: e.to_string(),
+                };
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = writeln!(stdout, "{}", json);
+                    let _ = stdout.flush();
+                }
                 continue;
             }
         };

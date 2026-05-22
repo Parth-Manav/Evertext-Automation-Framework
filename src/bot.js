@@ -1,6 +1,6 @@
 /**
  * @module bot
- * @description Discord.js bot controller for the Evertext automation framework.
+ * @description Discord.js bot controller for the hybrid terminal automation framework.
  * Handles slash command registration, permission checks, user interactions,
  * and sending formatted log messages to the configured Discord channel.
  */
@@ -17,10 +17,30 @@ dotenv.config();
 const logger = createLogger('bot');
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+const MAX_ACCOUNT_NAME_LENGTH = 64;
+const MAX_RESTORE_CODE_LENGTH = 512;
+const MAX_SERVER_NAME_LENGTH = 64;
+const MAX_COOKIE_LENGTH = 8_192;
+
+function requireTrimmedString(value, label, maxLength) {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+        throw new ValidationError(`${label} cannot be empty.`);
+    }
+    if (trimmed.length > maxLength) {
+        throw new ValidationError(`${label} must be ${maxLength} characters or less.`);
+    }
+    return trimmed;
+}
+
+function normalizeAccountName(name) {
+    return name.trim().toLowerCase();
+}
+
 const commands = [
     new SlashCommandBuilder()
         .setName('add_account')
-        .setDescription('Add a new game account')
+        .setDescription('Add a terminal workflow account')
         .addStringOption(option => option.setName('name').setDescription('Account Name').setRequired(true))
         .addStringOption(option => option.setName('code').setDescription('Restore Code').setRequired(true))
         .addBooleanOption(option => option.setName('server_toggle').setDescription('Enable Server Selection? (True=Select, False=Skip)').setRequired(true))
@@ -28,12 +48,6 @@ const commands = [
     new SlashCommandBuilder()
         .setName('list_accounts')
         .setDescription('List all configured accounts'),
-    new SlashCommandBuilder()
-        .setName('list_my_accounts')
-        .setDescription('List only your accounts'),
-    new SlashCommandBuilder()
-        .setName('toggle_ping')
-        .setDescription('Toggle ping notifications for your accounts'),
     new SlashCommandBuilder()
         .setName('force_run')
         .setDescription('Force run your account(s)')
@@ -46,7 +60,7 @@ const commands = [
         .setDescription('[ADMIN] Emergency kill-switch to stop all processes'),
     new SlashCommandBuilder()
         .setName('remove_account')
-        .setDescription('Remove a game account')
+        .setDescription('Remove a terminal workflow account')
         .addStringOption(option => option.setName('name').setDescription('Account Name to remove').setRequired(true)),
     new SlashCommandBuilder()
         .setName('set_schedule')
@@ -118,31 +132,24 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (commandName === 'add_account') {
-            const name = interaction.options.getString('name');
-            const code = interaction.options.getString('code');
+            const name = requireTrimmedString(interaction.options.getString('name'), 'Account name', MAX_ACCOUNT_NAME_LENGTH);
+            const code = requireTrimmedString(interaction.options.getString('code'), 'Restore code', MAX_RESTORE_CODE_LENGTH);
             const serverToggle = interaction.options.getBoolean('server_toggle');
-            let server = interaction.options.getString('server');
-
-            // Input Validation
-            if (!name || name.trim().length === 0) {
-                throw new ValidationError('Account name cannot be empty.');
-            }
-            if (!code || code.trim().length === 0) {
-                throw new ValidationError('Restore code cannot be empty.');
-            }
+            let server = interaction.options.getString('server')?.trim();
 
             // Logic Validation
-            if (serverToggle && (!server || server.trim().length === 0)) {
+            if (serverToggle && !server) {
                 await interaction.reply({ content: '❌ **Error**: You set `Server Selection: True`, so you MUST provide a `Target Server`!', ephemeral: true });
                 return;
             }
 
             // Default server string if skipping
-            if (!server || server.trim().length === 0) server = 'Auto-Skip';
+            if (!server) server = 'Auto-Skip';
+            server = requireTrimmedString(server, 'Target server', MAX_SERVER_NAME_LENGTH);
 
             // Encrypt the code before storing
-            const encryptedCode = encrypt(code.trim());
-            await addAccount(name.trim(), encryptedCode, server.trim(), serverToggle);
+            const encryptedCode = encrypt(code);
+            await addAccount(name, encryptedCode, server, serverToggle);
             await interaction.reply({ content: `✅ Account **${name.trim()}** added!\nServer Selection: **${serverToggle ? 'Enabled' : 'Disabled'}**\nTarget: ${server.trim()}`, ephemeral: true });
         }
         else if (commandName === 'list_accounts') {
@@ -187,7 +194,7 @@ client.on('interactionCreate', async interaction => {
             }
         }
         else if (commandName === 'force_run') {
-            const name = interaction.options.getString('name');
+            const name = interaction.options.getString('name')?.trim();
             const accounts = await getAccounts();
 
             if (!name) {
@@ -207,7 +214,7 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            const account = accounts.find(a => a.name === name);
+            const account = accounts.find(a => normalizeAccountName(a.name) === normalizeAccountName(name));
 
             if (!account) {
                 await interaction.reply({ content: `Account **${name}** not found.`, ephemeral: true });
@@ -284,14 +291,6 @@ client.on('interactionCreate', async interaction => {
             forceStop();
             await interaction.reply('🛑 **KILL-SWITCH ACTIVATED** - All processes will stop at next checkpoint.');
         }
-        else if (commandName === 'list_my_accounts') {
-            // Future enhancement: filter by Discord user ID
-            await interaction.reply({ content: 'This feature will be available soon!', ephemeral: true });
-        }
-        else if (commandName === 'toggle_ping') {
-            // Future enhancement: toggle ping notifications
-            await interaction.reply({ content: 'This feature will be available soon!', ephemeral: true });
-        }
         else if (commandName === 'set_log_channel') {
             // Admin check
             if (!interaction.memberPermissions.has('Administrator')) {
@@ -320,8 +319,7 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ content: `✅ Bot messages ${action}`, ephemeral: true });
         }
         else if (commandName === 'remove_account') {
-            const name = interaction.options.getString('name');
-            if (!name?.trim()) throw new ValidationError('Account name cannot be empty.');
+            const name = requireTrimmedString(interaction.options.getString('name'), 'Account name', MAX_ACCOUNT_NAME_LENGTH);
 
             const removed = await removeAccount(name);
 
@@ -348,10 +346,12 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ content: `✅ Schedule updated! Active hours: **${startStr}** to **${endStr}**` });
         }
         else if (commandName === 'set_cookies') {
-            const cookies = interaction.options.getString('cookies');
-            // Basic validation
-            if (!cookies || cookies.trim().length < 5) {
+            const cookies = interaction.options.getString('cookies')?.trim();
+            if (!cookies || cookies.length < 5) {
                 throw new ValidationError('Invalid cookie string provided.');
+            }
+            if (cookies.length > MAX_COOKIE_LENGTH) {
+                throw new ValidationError(`Cookie string must be ${MAX_COOKIE_LENGTH} characters or less.`);
             }
             await setCookies(cookies);
             await interaction.reply({ content: '✅ Global session cookies updated! New sessions will use these cookies.', ephemeral: true });

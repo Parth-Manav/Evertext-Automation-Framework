@@ -1,6 +1,6 @@
 /**
  * @module websocket-client
- * @description Manages the raw WebSocket connection to the game's Socket.IO server.
+ * @description Manages the raw WebSocket connection to the target Socket.IO server.
  * Handles the Engine.IO handshake, ping/pong keepalives, and event parsing.
  */
 
@@ -13,7 +13,9 @@ import {
     WS_PING_INTERVAL_MULTIPLIER,
     WS_COMMAND_DELAY_MS,
     WS_ACTIVITY_SILENCE_MS,
-    WS_ACTIVITY_CHECK_INTERVAL_MS
+    WS_ACTIVITY_CHECK_INTERVAL_MS,
+    GAME_URL,
+    TARGET_NAME
 } from './constants.js';
 import { ConnectionFailedError, IdleTimeoutError } from './errors.js';
 
@@ -54,11 +56,11 @@ export class EvertextWebSocketClient extends EventEmitter {
             const headers = {
                 'Cookie': `session=${this.sessionCookie}`,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Origin': 'https://evertext.sytes.net',
-                'Host': 'evertext.sytes.net'
+                'Origin': new URL(GAME_URL).origin,
+                'Host': new URL(GAME_URL).host
             };
 
-            logger.info('Connecting to EverText terminal...');
+            logger.info(`Connecting to ${TARGET_NAME} terminal...`);
 
             this.ws = new WebSocket(WS_BASE_URL, { headers });
 

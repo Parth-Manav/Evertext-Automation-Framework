@@ -1,6 +1,6 @@
 /**
  * @module index
- * @description Main entry point for the Evertext automation framework.
+ * @description Main entry point for the hybrid terminal automation framework.
  * Orchestrates startup sequence, health checks, bot initialization, and graceful shutdown.
  */
 
@@ -15,7 +15,7 @@ import { createLogger } from './src/logger.js';
 const execAsync = promisify(exec);
 const logger = createLogger('main');
 
-logger.info('Starting Evertext Auto Bot...');
+logger.info('Starting Hybrid Terminal Automation Framework...');
 
 /**
  * Checks for and terminates any orphaned headless Chrome processes left over

@@ -146,14 +146,14 @@ Simultaneous multi-session execution is intentionally **not** supported to avoid
 ## Known Limitations
 
 - Sequential queue only — no parallel sessions
-- Hardcoded target URL and WebSocket endpoint in constants
+- Target URL and WebSocket endpoint are configured with `GAME_URL` and `WS_BASE_URL`
 - Rust brain path must exist at `evertext_brain/target/release/evertext_brain[.exe]`
 - Discord log delivery is best-effort (3 retries)
-- `ManaRefillFlow` state exists in Rust but is isolated / unused
+- The Rust state machine currently models one authorized terminal workflow
 
 ## Future Improvements
 
 - Per-operator session filtering in Discord commands
-- Configurable target URL via environment
+- Adapter-style prompt/action configuration for additional terminal workflows
 - Metrics export (Prometheus) from health server
 - Parallel sessions with terminal slot coordination

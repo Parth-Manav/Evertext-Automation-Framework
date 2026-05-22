@@ -3,6 +3,10 @@
  * @description Centralized configuration and magic values for the Evertext automation framework.
  */
 
+import dotenv from 'dotenv';
+
+dotenv.config();
+
 // --- Timing: session & queue ---
 /** @constant {number} Delay between processing individual sessions (10 seconds) */
 export const INTER_ACCOUNT_DELAY_MS = 10_000;
@@ -176,11 +180,14 @@ export const ERROR_CODE_IDLE_TIMEOUT = 'IDLE_TIMEOUT';
 /** @constant {string} WebSocket connection failed */
 export const ERROR_CODE_CONNECTION_FAILED = 'CONNECTION_FAILED';
 
-/** @constant {string} Target game URL */
-export const GAME_URL = 'https://evertext.sytes.net';
+/** @constant {string} Human-readable target name for logs and docs */
+export const TARGET_NAME = process.env.TARGET_NAME?.trim() || 'Terminal Service';
+
+/** @constant {string} Target terminal web URL */
+export const GAME_URL = process.env.GAME_URL?.trim() || 'https://example.com';
 
 /** @constant {string} WebSocket base URL (Socket.IO over Engine.IO) */
-export const WS_BASE_URL = 'wss://evertext.sytes.net/socket.io/?EIO=4&transport=websocket';
+export const WS_BASE_URL = process.env.WS_BASE_URL?.trim() || 'wss://example.com/socket.io/?EIO=4&transport=websocket';
 
 /** @constant {number} Silence threshold before emitting connection timeout (2 minutes) */
 export const WS_ACTIVITY_SILENCE_MS = 120_000;

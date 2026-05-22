@@ -14,6 +14,12 @@ let isHealthy = true;
 /** @type {number} */
 let lastActivityTime = Date.now();
 
+const runtimeState = {
+    queueRunning: false,
+    activeAccount: null,
+    brainRunning: false
+};
+
 /**
  * Starts a minimal HTTP server exposing `/health` and `/ping` endpoints.
  * @param {number} [port=3000] - Port to listen on (overridden by `PORT` env in index.js).
@@ -31,7 +37,11 @@ export function startHealthServer(port = 3000) {
                 status: healthy ? 'ok' : 'degraded',
                 uptime: uptimeSeconds,
                 lastActivitySeconds: Math.floor(timeSinceActivity / 1000),
-                memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024)
+                lastActivityAt: new Date(lastActivityTime).toISOString(),
+                memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+                queueRunning: runtimeState.queueRunning,
+                activeAccount: runtimeState.activeAccount,
+                brainRunning: runtimeState.brainRunning
             }));
         } else {
             res.writeHead(404);
@@ -56,6 +66,17 @@ export function startHealthServer(port = 3000) {
  */
 export function updateActivity() {
     lastActivityTime = Date.now();
+}
+
+/**
+ * Updates public health metadata without exposing credentials or cookies.
+ * @param {{queueRunning?: boolean, activeAccount?: string|null, brainRunning?: boolean}} state
+ * @returns {void}
+ */
+export function updateHealthState(state) {
+    if ('queueRunning' in state) runtimeState.queueRunning = Boolean(state.queueRunning);
+    if ('activeAccount' in state) runtimeState.activeAccount = state.activeAccount || null;
+    if ('brainRunning' in state) runtimeState.brainRunning = Boolean(state.brainRunning);
 }
 
 /**

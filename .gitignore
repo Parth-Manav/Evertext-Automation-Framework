@@ -8,26 +8,23 @@ npm-debug.log
 # Logs
 logs/
 *.log
+*.tmp
+*.png
 
 # Runtime data
 db.json
 db.json.backup
-# preventing db.json from being ignored if it was previously tracked, but usually local db should be ignored. 
-# However, user mentioned db.json.backup specifically earlier. 
-# I will ignore the backup. The main db.json might be needed if it has the initial structure.
-# But generally for a bot template, we don't push the DB.
-# Let's stick to what was explicitly requested before: db.json.backup.
 
 # Build artifacts
 bot.exe
 node.exe
 evertext_brain/target/
 bin/
-# We created a bin/ folder for the rust exe, that probably shouldn't be in the repo if it contains binaries.
-# But wait, if the user wants to distribute it... usually binaries aren't committed.
-# But for "self-bot" maybe they want it? 
-# Best practice: Ignore binaries.
-# NOTE: Don't use *.exe because it will ignore the Rust brain binary too!
+dist/
+*.mp4
+*.mov
+*.avi
+*.mkv
 
 # Editor
 .vscode/

@@ -11,7 +11,7 @@ import { runSession } from './runner.js';
 import { sendLog } from './bot.js';
 import { AsyncLock } from './async-lock.js';
 import { config } from './config.js';
-import { updateActivity } from './health-server.js';
+import { updateActivity, updateHealthState } from './health-server.js';
 import { rotateLogs } from './log-rotator.js';
 import { createLogger } from './logger.js';
 import {
@@ -115,6 +115,7 @@ const processQueueFull = async () => {
     }
 
     isRunning = true;
+    updateHealthState({ queueRunning: true });
     lock.release(); // Release lock after setting flag
     shouldStop = false;
     let sharedBrowser = null;
@@ -145,6 +146,7 @@ const processQueueFull = async () => {
             }
 
             const account = pendingAccounts[i];
+            updateHealthState({ activeAccount: account.name });
 
             // --- 10-Minute Zigza Defer Mechanism ---
             // If an account hit a rate limit (Zigza error), it's placed in 'deferredAccounts'.
@@ -300,6 +302,7 @@ const processQueueFull = async () => {
     } finally {
         isRunning = false;
         shouldStop = false;
+        updateHealthState({ queueRunning: false, activeAccount: null, brainRunning: false });
     }
 };
 
@@ -325,6 +328,7 @@ export const executeSession = async (accountId) => {
     }
 
     isRunning = true;
+    updateHealthState({ queueRunning: true });
     release();
     let browser = null;
 
@@ -335,6 +339,7 @@ export const executeSession = async (accountId) => {
         }
 
         logger.info(`Running single account: ${account.name}`);
+        updateHealthState({ activeAccount: account.name });
         await updateAccountStatus(account.id, ACCOUNT_STATUS.RUNNING);
 
         const result = await runSession(account, null);
@@ -361,6 +366,7 @@ export const executeSession = async (accountId) => {
             } catch (e) { /* ignore */ }
         }
         isRunning = false;
+        updateHealthState({ queueRunning: false, activeAccount: null, brainRunning: false });
     }
 };
 
@@ -379,6 +385,7 @@ export const executeFountain = async (accountId) => {
     }
 
     isRunning = true;
+    updateHealthState({ queueRunning: true });
     release();
     let browser = null;
 
@@ -389,6 +396,7 @@ export const executeFountain = async (accountId) => {
         }
 
         logger.info(`Running fountain for account: ${account.name}`);
+        updateHealthState({ activeAccount: account.name });
         await updateAccountStatus(account.id, ACCOUNT_STATUS.RUNNING);
 
         // Pass mode: 'fountain' to runSession
@@ -416,6 +424,7 @@ export const executeFountain = async (accountId) => {
             } catch (e) { /* ignore */ }
         }
         isRunning = false;
+        updateHealthState({ queueRunning: false, activeAccount: null, brainRunning: false });
     }
 };
 
@@ -430,6 +439,7 @@ export const runFountainBatch = async () => {
 
     const release = await lock.acquire();
     isRunning = true;
+    updateHealthState({ queueRunning: true });
 
     let completedCount = 0;
     let sharedBrowser = null;
@@ -454,6 +464,7 @@ export const runFountainBatch = async () => {
             }
 
             const account = accounts[i];
+            updateHealthState({ activeAccount: account.name });
             try {
                 logger.info(`\n[${i + 1}/${accounts.length}] Fountain for ${account.name}...`);
                 await updateAccountStatus(account.id, ACCOUNT_STATUS.RUNNING);
@@ -497,6 +508,7 @@ export const runFountainBatch = async () => {
             }
         }
         isRunning = false;
+        updateHealthState({ queueRunning: false, activeAccount: null, brainRunning: false });
         release();
     }
 };

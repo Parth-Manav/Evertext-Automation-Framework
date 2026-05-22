@@ -158,18 +158,22 @@ export const migrateUnencryptedCodes = async () => {
  * @returns {Promise<boolean>} True if successful.
  */
 export const addAccount = async (name, encryptedCode, targetServer, serverToggle = true) => {
-  if (!name?.trim()) throw new ValidationError('Account name cannot be empty');
+  name = name?.trim();
+  targetServer = targetServer?.trim();
+  if (!name) throw new ValidationError('Account name cannot be empty');
+  if (name.length > 64) throw new ValidationError('Account name must be 64 characters or less');
   if (!encryptedCode?.trim()) throw new ValidationError('Encrypted code cannot be empty');
-  if (!targetServer?.trim()) throw new ValidationError('Target server cannot be empty');
+  if (!targetServer) throw new ValidationError('Target server cannot be empty');
+  if (targetServer.length > 64) throw new ValidationError('Target server must be 64 characters or less');
 
   const release = await dbLock.acquire();
   try {
     await db.read();
 
   // Prevent duplicate names
-  if (db.data.accounts.find(acc => acc.name === name)) {
+  if (db.data.accounts.find(acc => acc.name.toLowerCase() === name.toLowerCase())) {
     // Overwrite existing
-    const index = db.data.accounts.findIndex(acc => acc.name === name);
+    const index = db.data.accounts.findIndex(acc => acc.name.toLowerCase() === name.toLowerCase());
     db.data.accounts[index] = {
       ...db.data.accounts[index],
       encryptedCode,
@@ -210,11 +214,13 @@ export const getAccounts = async () => {
  * @returns {Promise<boolean>} True if removed, false if not found.
  */
 export const removeAccount = async (name) => {
+  name = name?.trim();
+  if (!name) throw new ValidationError('Account name cannot be empty');
   const release = await dbLock.acquire();
   try {
     await db.read();
     const initialLength = db.data.accounts.length;
-  db.data.accounts = db.data.accounts.filter(a => a.name !== name);
+  db.data.accounts = db.data.accounts.filter(a => a.name.toLowerCase() !== name.toLowerCase());
   await writeAndInvalidate();
   release();
   return db.data.accounts.length < initialLength;
