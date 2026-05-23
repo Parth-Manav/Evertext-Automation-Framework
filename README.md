@@ -170,6 +170,7 @@ The response includes process uptime, memory usage, last activity time, queue st
 ## Responsible Use
 
 This project is intended for authorized automation, controlled testing, and engineering education. Do not use it against services where automation is prohibited or where you do not have permission. Keep credentials and local databases out of version control, respect rate limits, and prefer explicit approval from service owners before automating a target.
+Thank You
 
 ## Limitations
 
