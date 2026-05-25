@@ -8,7 +8,7 @@ The project is designed to demonstrate automation engineering, process orchestra
 
 GitHub attachment:
 
-[Evertext automation demo](https://github.com/user-attachments/assets/9e6ae87b-62be-4f77-826a-9ac8bb99c513)
+https://github.com/user-attachments/assets/712fc37d-7844-4edf-85c0-cc098102163e
 
 ## Overview
 
